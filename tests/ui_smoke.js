@@ -1,6 +1,6 @@
 // jsdom smoke test: boots the real UI against a stubbed API, checks login, listing, selection, menus, viewer, editor, settings.
 const fs = require("fs"), path = require("path");
-const { JSDOM } = require(process.env.JSDOM_PATH || "jsdom");
+const { JSDOM } = require(process.env.JSDOM_PATH ? path.resolve(process.env.JSDOM_PATH) : "jsdom");
 const root = path.join(__dirname, "..", "arkstorage", "static");
 let html = fs.readFileSync(path.join(root, "index.html"), "utf8").replace(/\{\{v\}\}/g, "t");
 html = html.replace(/<script src="[^"]+"><\/script>/g, "");
