@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ark-storage
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: ARK_REPO_URL
+        sync: false
+      - key: ARK_GITHUB_TOKEN
+        sync: false
+      - key: ARK_SECRET_KEY
+        generateValue: true

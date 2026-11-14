@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+gunicorn>=22.0; sys_platform != "win32"
+cryptography>=42
+requests>=2.31

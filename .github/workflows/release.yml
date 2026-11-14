@@ -1,0 +1,26 @@
+name: Release
+on:
+  push: { tags: ["v*"] }
+permissions: { contents: write }
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version matches tag
+        run: |
+          v=$(python -c "import re;print(re.search(r'\"(.+)\"',open('arkstorage/__init__.py').read().split('__version__')[1]).group(1))")
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != version v$v"; exit 1; }
+      - name: Build assets
+        run: |
+          n=ark-storage-${GITHUB_REF_NAME#v}
+          git archive --format=tar.gz --prefix=$n/ -o $n.tar.gz HEAD
+          git archive --format=zip --prefix=$n/ -o $n.zip HEAD
+          cp .env.example env.example
+          sha256sum $n.tar.gz $n.zip docker-compose.yml render.yaml env.example > SHA256SUMS
+      - name: Publish
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## "v"$"{f=1;next} /^## /{f=0} f' CHANGELOG.md)
+          gh release create "$GITHUB_REF_NAME" --title "Ark Storage ${GITHUB_REF_NAME#v}" --notes "$notes" \
+            ark-storage-*.tar.gz ark-storage-*.zip docker-compose.yml render.yaml env.example SHA256SUMS
