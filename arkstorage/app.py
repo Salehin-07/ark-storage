@@ -2,6 +2,7 @@
 import base64
 import contextlib
 import functools
+import gzip
 import mimetypes
 import os
 import re
@@ -24,6 +25,7 @@ from .store import Ingest, Store
 from .vfs import VfsError
 
 STATIC = Path(__file__).parent / "static"
+COMPRESSIBLE = {"application/json", "application/javascript", "application/manifest+json", "image/svg+xml"}
 TEXT_LIMIT = 5 * 1024 * 1024
 KINDS = {
     "image": {"png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "svg", "tif", "tiff", "heic"},
@@ -118,6 +120,35 @@ def create_app():
             info_cache["t"] = time.time()
         return info_cache["v"]
 
+    gz_memo = {}
+
+    def squeeze(r):
+        """gzip text responses (JSON listings, JS, CSS, HTML). Streams, ranges and media are left alone;
+        static files are compressed once per version and served from memory after that."""
+        if (r.status_code != 200 or r.is_streamed and not r.direct_passthrough or "Content-Encoding" in r.headers
+                or "gzip" not in request.headers.get("Accept-Encoding", "")
+                or not (r.mimetype.startswith("text/") or r.mimetype in COMPRESSIBLE)):
+            return r
+        static = request.path.startswith("/static/") and r.direct_passthrough
+        if r.direct_passthrough and not static:
+            return r
+        key = (request.path, r.headers.get("ETag")) if static and r.headers.get("ETag") else None
+        z = gz_memo.get(key) if key else None
+        if z is None:
+            if static:
+                r.direct_passthrough = False
+            data = r.get_data()
+            if len(data) < 1024:
+                return r
+            z = gzip.compress(data, compresslevel=6, mtime=0)
+            if key:
+                gz_memo[key] = z
+        r.set_data(z)
+        r.headers["Content-Encoding"] = "gzip"
+        r.headers["Content-Length"] = str(len(z))
+        r.headers.add("Vary", "Accept-Encoding")
+        return r
+
     @app.after_request
     def headers(r):
         r.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -125,7 +156,7 @@ def create_app():
         r.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         if request.path.startswith("/api/") and "Cache-Control" not in r.headers:
             r.headers["Cache-Control"] = "no-store"
-        return r
+        return squeeze(r)
 
     # ---------------------------------------------------------------- pages
     @app.get("/")
@@ -142,7 +173,14 @@ def create_app():
     @app.get("/static/<path:name>")
     def static_files(name):
         r = send_from_directory(STATIC, name)
-        r.headers["Cache-Control"] = "no-cache"
+        # /static/app.js?v=1.0.2 changes whenever the release does, so a versioned URL can be cached for good.
+        r.headers["Cache-Control"] = "public, max-age=31536000, immutable" if request.args.get("v") else "no-cache"
+        return r
+
+    @app.get("/favicon.ico")
+    def favicon():
+        r = send_from_directory(STATIC, "icon-32.png")
+        r.headers["Cache-Control"] = "public, max-age=86400"
         return r
 
     @app.get("/healthz")
@@ -153,7 +191,9 @@ def create_app():
     def manifest():
         return jsonify(name="Ark Storage", short_name="Ark", start_url="/", display="standalone",
                        background_color="#0f1115", theme_color="#0f1115",
-                       icons=[{"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}])
+                       icons=[{"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                              {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                              {"src": "/static/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}])
 
     # ---------------------------------------------------------------- session
     @app.get("/api/session")
@@ -740,7 +780,7 @@ def create_app():
     def status():
         out = {"version": __version__, "problems": store.problems(), "branch": config.get("branch"),
                "repo_url": config.get("repo_url"), "git": bool(shutil.which("git")), "crypto": store.crypto_state(),
-               "cache_bytes": store.cache.size(), "last_error": store.last_error}
+               "cache_bytes": store.cache.size(), "last_error": store.last_error, "trash": bool(config.get("trash"))}
         if not out["problems"]:
             try:
                 info = repo_info()

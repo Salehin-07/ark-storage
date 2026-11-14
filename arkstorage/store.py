@@ -732,7 +732,7 @@ class Store:
                         meta.pop(k)
                         dirty["meta"] = True
                     mark_removed(n)
-                    results.append({"path": p})
+                    results.append({"path": p, "trash_id": None if permanent else tid})
             elif op in ("move", "copy"):
                 copy = op == "copy"
                 dest = it["dest"]

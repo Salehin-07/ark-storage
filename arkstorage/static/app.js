@@ -2,12 +2,20 @@
 (function () {
   "use strict";
   const { h, icon, fmtBytes, fmtDate, toast, modal, ask, prompt, choose, popMenu, closeMenu, api, S, enc } = window.UI;
-  const FC = window.FilesCore;
+  const FC = window.FilesCore, PR = window.ArkProgress;
+
+  // Start the two requests every page load needs right away and in parallel, instead of session first and
+  // the folder listing only after it. (A signed-out visitor just gets a 401 for the listing, which is dropped.)
+  const hashPath = () => { const x = decodeURIComponent(location.hash.slice(1)); return x === "!trash" ? null : x.startsWith("/") ? x : "/"; };
+  const quick = (url) => fetch(url, { credentials: "same-origin" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const pre = { path: hashPath(), session: quick("/api/session"), list: null };
+  if (pre.path) pre.list = quick("/api/list?path=" + enc(pre.path));
 
   const st = {
     path: "/", entries: [], sel: [], anchor: null, view: localStorage.getItem("ark.view") || "list",
     sort: JSON.parse(localStorage.getItem("ark.sort") || '{"key":"name","dir":1}'), clip: null, mode: "files", // files | trash | search
-    query: "", status: null, loadErr: "", head: "", trash: [], jobs: [], xferOpen: true, dismissed: {}, user: "",
+    query: "", status: null, loadErr: "", head: "", trash: [], trashLoaded: false, jobs: [], xferOpen: true, dismissed: {}, user: "",
+    pending: 0, flash: null,
   };
   const $ = (s, r) => (r || document).querySelector(s);
   const app = $("#app");
@@ -24,8 +32,10 @@
 
   // ------------------------------------------------------------ boot / login
   async function boot() {
-    let s;
-    try { s = await api("/api/session"); } catch (e) { document.body.textContent = e.message; return; }
+    let s = null;
+    try { s = pre.session ? await pre.session : null; } catch (e) { s = null; }
+    pre.session = null;
+    if (!s || !("csrf" in s)) { try { s = await api("/api/session"); } catch (e) { document.body.textContent = e.message; return; } }
     S.csrf = s.csrf;
     applyTheme(s.theme);
     if (s.authed) { st.user = s.user; start(s); } else showLogin();
@@ -63,7 +73,7 @@
   function build() {
     el = {};
     el.crumbs = h("div", { id: "crumbs", role: "navigation", "aria-label": "Path" });
-    el.search = h("input", { class: "inp", type: "search", placeholder: "Search files…", "aria-label": "Search", oninput: debounce(onSearch, 250) });
+    el.search = h("input", { class: "inp", type: "search", placeholder: "Search files…  ( / )", "aria-label": "Search", oninput: debounce(onSearch, 180) });
     el.viewSeg = h("div", { class: "seg", role: "group" });
     el.paste = btn("Paste", "paste", doPaste, "", "Paste here"); el.paste.hidden = true;
     el.bar = h("div", { id: "bar" }, el.crumbs, el.paste, el.viewSeg, btn("New", "plus", (e) => newMenu(e.currentTarget), "primary", "Create or upload"));
@@ -85,12 +95,12 @@
       h("button", { class: "nav", type: "button", onclick: logout }, icon("logout"), "Sign out"));
     const top = h("header", { id: "top" },
       h("button", { class: "btn icon ghost", id: "menu-btn", style: { display: "none" }, type: "button", "aria-label": "Menu", onclick: () => el.side.classList.toggle("open") }, icon("menu")),
-      h("div", { class: "brand-s" }, h("img", { src: "/static/icon.svg", alt: "" }), h("span", null, "Ark Storage")),
-      h("div", { id: "search" }, icon("search"), el.search), h("div", { class: "spacer" }),
+      h("div", { id: "search" }, icon("search"), el.search),
       btn("", "up", () => { el.xferOpen = true; st.xferOpen = true; renderXfer(); }, "icon ghost hide-m", "Transfers"),
       btn("", "sun", toggleTheme, "icon ghost", "Toggle theme"));
     el.fab = h("button", { id: "fab", type: "button", "aria-label": "New", onclick: (e) => newMenu(e.currentTarget) }, icon("plus"));
-    el.main = h("main", { id: "main" }, el.bar, el.banner, el.selBar, el.wrap, el.statusBar);
+    el.sync = h("div", { id: "sync", "aria-hidden": "true" });
+    el.main = h("main", { id: "main" }, el.sync, el.bar, el.banner, el.selBar, el.wrap, el.statusBar);
     app.replaceChildren(top, el.side, el.main, el.xfer, el.fab, el.fileIn, el.dirIn);
     renderViewSeg();
     bindList();
@@ -122,14 +132,42 @@
   }
   function go(path) { const want = "#" + encodeURI(path).replace(/#/g, "%23"); if (location.hash === want || (path === "/" && !location.hash)) route(); else location.hash = want; }
 
+  // Folder listings are cached for the session and always revalidated: opening a folder you've seen is instant,
+  // and the screen only redraws if GitHub says something changed. Hovering a folder warms its cache.
+  const dirCache = new Map(), inflight = new Set();
+  let gen = 0, loadSeq = 0, idleWaiters = [];
+  const cacheDir = (path, d) => { dirCache.delete(path); dirCache.set(path, d); if (dirCache.size > 40) dirCache.delete(dirCache.keys().next().value); };
+  const invalidate = () => { gen++; dirCache.clear(); };
+  function takePre(path) { const q = pre.list && pre.path === path ? pre.list : null; pre.list = null; return q; }
+  function prefetchDir(path) {
+    if (dirCache.has(path) || inflight.has(path)) return;
+    inflight.add(path); const g = gen;
+    api("/api/list?path=" + enc(path)).then((d) => { if (g === gen) cacheDir(path, d); }).catch(() => {}).finally(() => inflight.delete(path));
+  }
+  function applyDir(d) {
+    st.entries = d.entries; st.crumbs = d.crumbs; st.head = d.head; st.loadErr = "";
+    st.sel = FC.pruneSelection(st.entries.map((e) => e.path), st.sel);
+  }
   async function load(path, quiet) {
+    const seq = ++loadSeq, cached = dirCache.get(path), first = takePre(path);
     st.path = path; st.mode = "files";
-    if (!quiet) { el.list.replaceChildren(h("div", { class: "empty" }, "Loading…")); }
+    let showed = false, timer = 0;
+    if (!quiet) {
+      if (cached) { applyDir(cached); render(); showed = true; }
+      else timer = setTimeout(() => { if (seq === loadSeq) el.list.replaceChildren(h("div", { class: "empty" }, "Loading…")); }, 140);   // no flash for fast loads
+    }
     try {
-      const d = await api("/api/list?path=" + enc(path));
-      st.entries = d.entries; st.crumbs = d.crumbs; st.head = d.head; st.loadErr = "";
-      st.sel = FC.pruneSelection(st.entries.map((e) => e.path), st.sel);
+      const d = (first && (await first)) || (await api("/api/list?path=" + enc(path)));
+      clearTimeout(timer);
+      if (seq !== loadSeq) return;
+      if (quiet && st.pending) return;                 // an optimistic change is on screen; the final reload reconciles it
+      cacheDir(path, d);
+      if (showed && cached.head === d.head) return;    // nothing changed: no redraw
+      applyDir(d);
     } catch (e) {
+      clearTimeout(timer);
+      if (seq !== loadSeq) return;
+      if (showed) { toast("Couldn't refresh: " + e.message, "bad"); return; }
       st.loadErr = e.message; st.entries = []; st.crumbs = [{ name: "Home", path: "/" }];
       if (e.status === 404 && path !== "/") { toast("That folder no longer exists", "bad"); return go("/"); }
     }
@@ -221,6 +259,10 @@
     }
     el.list.replaceChildren(...kids);
     paint();
+    if (st.flash) {                                    // draw the eye to the item that was just created
+      const r = [...el.list.querySelectorAll(".row")].find((x) => x.dataset.path === st.flash);
+      if (r) { st.flash = null; r.classList.add("flash"); r.scrollIntoView({ block: "nearest" }); }
+    }
   }
 
   function rowEl(e) {
@@ -229,12 +271,14 @@
     if (st.view === "grid" && e.kind === "image" && e.size < 3e6) {
       ic = h("div", { class: "ic image" }, h("img", { loading: "lazy", alt: "", src: "/api/raw?path=" + enc(e.path), onerror: (ev) => ev.target.replaceWith(icon("image")) }));
     } else ic = h("div", { class: "ic " + e.kind }, icon(KIND_ICON[e.kind] || "file"));
-    const r = h("div", { class: "row", role: "row", tabindex: 0, draggable: st.mode !== "search", "aria-label": e.name },
+    const r = h("div", { class: "row" + (e.pending ? " pending" : ""), role: "row", tabindex: 0, draggable: st.mode !== "search" && !e.pending, "aria-label": e.name },
       h("input", { type: "checkbox", class: "chk", tabindex: -1, "aria-label": "Select " + e.name }),
-      h("div", { class: "nm" }, ic, h("span", { class: "t", title: e.path }, e.name), tip, st.mode === "search" ? h("span", { class: "muted", style: { fontSize: "12px" } }, e.path) : null),
+      h("div", { class: "nm" }, ic, h("span", { class: "t", title: e.path }, e.name), tip, e.pending ? icon("refresh", "spin") : null, st.mode === "search" ? h("span", { class: "muted", style: { fontSize: "12px" } }, e.path) : null),
       h("div", { class: "sz" }, e.dir ? (e.items != null ? e.items + (e.items === 1 ? " item" : " items") : "") : fmtBytes(e.size)),
       h("div", { class: "md" }, fmtDate(e.mtime)));
     r.dataset.path = e.path;
+    if (e.dir) r.dataset.dir = "1";
+    if (e.pending) r.dataset.pending = "1";
     return r;
   }
 
@@ -249,10 +293,15 @@
     });
     const all = el.list.querySelector(".head .chk"); if (all) { all.checked = st.sel.length && st.sel.length === (st.shown || []).length; all.classList.toggle("always", st.sel.length > 0); }
     renderSelBar();
+    renderStatus();
+  }
+  function renderStatus() {
     const files = st.entries.filter((e) => !e.dir).length, dirs = st.entries.length - files;
     el.statusBar.replaceChildren(h("span", null, st.mode === "trash" ? `${st.trash.length} in trash` : `${dirs} folder${dirs === 1 ? "" : "s"}, ${files} file${files === 1 ? "" : "s"}`),
-      st.sel.length ? h("span", null, FC.describeSelection ? "" : "", `${st.sel.length} selected`) : null, h("span", { class: "spacer" }), h("span", null, st.head ? "commit " + st.head : ""));
+      st.sel.length ? h("span", null, `${st.sel.length} selected`) : null, st.pending ? h("span", { class: "saving" }, "Saving to GitHub…") : null,
+      h("span", { class: "spacer" }), h("span", null, st.head ? "commit " + st.head : ""));
   }
+  const syncUI = () => { el.sync.classList.toggle("on", st.pending > 0); renderStatus(); };
 
   function selEntries() { const m = new Map(st.entries.map((e) => [e.path, e])); return st.sel.map((p) => m.get(p)).filter(Boolean); }
 
@@ -268,7 +317,7 @@
       btn("Copy", "copy", () => setClip(false)), btn("Cut", "cut", () => setClip(true)),
       btn("Compress", "zip", () => compress(es)), one && /\.zip$/i.test(one.name) ? btn("Extract", "archive", () => extract(one)) : null,
       one ? btn("Properties", "info", () => props(one)) : null,
-      btn("Delete", "trash", () => del(es), "danger"),
+      btn("Delete", "trash", () => del(es), "danger", trashOn() ? "Move to trash" : "Delete"),
       h("span", { class: "spacer" }), btn("Select all", "select", () => { st.sel = st.shown.map((e) => e.path); paint(); }, "ghost"),
       btn("", "x", () => { st.sel = []; paint(); }, "icon ghost", "Clear selection"));
   }
@@ -280,6 +329,7 @@
     L.addEventListener("pointerdown", (e) => {
       lastPointer = e.pointerType || "mouse";
       const row = e.target.closest(".row");
+      if (row && row.dataset.dir && !row.dataset.pending && st.mode === "files") prefetchDir(row.dataset.path);   // the click follows ~100 ms later
       if (lastPointer === "touch" && row && !e.target.closest(".chk")) {
         pressed = false;
         const sx = e.clientX, sy = e.clientY;
@@ -287,6 +337,12 @@
         const cancel = (ev) => { if (ev.type === "pointermove" && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 8) return; clearTimeout(pressTimer); L.removeEventListener("pointermove", cancel); L.removeEventListener("pointerup", cancel); L.removeEventListener("pointercancel", cancel); };
         L.addEventListener("pointermove", cancel); L.addEventListener("pointerup", cancel); L.addEventListener("pointercancel", cancel);
       }
+    });
+    let hoverT = 0;
+    L.addEventListener("pointerover", (e) => {
+      const row = e.pointerType === "touch" ? null : e.target.closest(".row");
+      clearTimeout(hoverT);
+      if (row && row.dataset.dir && !row.dataset.pending && st.mode === "files") hoverT = setTimeout(() => prefetchDir(row.dataset.path), 90);
     });
     L.addEventListener("click", (e) => {
       if (pressed) { pressed = false; return; }
@@ -343,11 +399,14 @@
     else if (mod && e.key.toLowerCase() === "c" && es.length) { e.preventDefault(); setClip(false); }
     else if (mod && e.key.toLowerCase() === "x" && es.length) { e.preventDefault(); setClip(true); }
     else if (mod && e.key.toLowerCase() === "v" && st.clip) { e.preventDefault(); doPaste(); }
-    else if (e.key === "Delete" && es.length) { e.preventDefault(); del(es); }
+    else if (e.key === "Delete" && es.length) { e.preventDefault(); del(es, e.shiftKey); }
+    else if (e.key === "/" || (mod && e.key.toLowerCase() === "k")) { e.preventDefault(); el.search.focus(); el.search.select(); }
     else if (e.key === "F2" && es.length === 1) { e.preventDefault(); rename(es[0]); }
     else if (e.key === "Escape") { st.sel = []; paint(); closeSide(); }
     else if (e.key === "Backspace" && st.mode === "files" && st.path !== "/") { e.preventDefault(); go(parentOf(st.path)); }
   }
+  const trashOn = () => !st.status || st.status.trash !== false;
+  const whenIdle = () => (st.pending ? new Promise((r) => idleWaiters.push(r)) : Promise.resolve());
   const parentOf = (p) => p.replace(/\/[^/]*$/, "") || "/";
   const joinp = (d, n) => (d === "/" ? "" : d) + "/" + n;
 
@@ -364,12 +423,14 @@
       one && /\.zip$/i.test(one.name) ? { label: "Extract here", icon: "archive", run: () => extract(one) } : null,
       one && !one.dir && one.kind === "text" ? { label: "Edit", icon: "edit", run: () => editPath(one) } : null,
       one ? { label: "Properties", icon: "info", run: () => props(one) } : null, "-",
-      { label: "Delete", icon: "trash", danger: true, run: () => del(es) }]);
+      { label: trashOn() ? "Move to trash" : "Delete forever", icon: "trash", danger: true, run: () => del(es) },
+      trashOn() ? { label: "Delete forever…", icon: "x", danger: true, run: () => del(es, true) } : null]);
   }
 
   // ------------------------------------------------------------ opening things
   function openPath(path) {
     const e = st.entries.find((x) => x.path === path); if (!e) return;
+    if (e.pending) { toast("Saving “" + e.name + "”…"); whenIdle().then(() => { const n = st.entries.find((x) => x.path === path); if (n) openPath(path); }); return; }
     if (e.dir) { go(e.path); return; }
     if (["image", "video", "audio", "pdf"].includes(e.kind)) return openViewer(e);
     if (e.kind === "archive" || e.kind === "binary") { toast("Can't preview this type; downloading instead"); return downloadSel([e]); }
@@ -411,49 +472,80 @@
       { label: "New folder", icon: "folderplus", run: newFolder }, { label: "New file", icon: "fileplus", run: newFile }, "-",
       { label: "Upload files", icon: "upload", run: () => el.fileIn.click() }, { label: "Upload folder", icon: "folder", run: () => el.dirIn.click() }]);
   }
+
+  // Writes the way fast apps do them: the screen changes immediately, GitHub is told in the background,
+  // and if that fails the real state is reloaded and the error shown. Several can be in flight at once;
+  // the list is reconciled with the server when the last one finishes.
+  async function optimistic(local, remote) {
+    if (local) local();
+    st.pending++; syncUI();
+    let out = null;
+    try { out = await remote(); } catch (e) { toast(e.message, "bad"); out = null; }
+    st.pending--; invalidate(); syncUI();
+    if (!st.pending) { await reload(); loadStatus(); const w = idleWaiters; idleWaiters = []; w.forEach((f) => f()); }
+    return out;
+  }
+  function addLocal(dir, entry) {
+    if (st.mode !== "files" || st.path !== dir || entry.name.includes("/")) return;
+    st.entries = st.entries.concat(entry); render();
+  }
+  const exists = (p) => st.entries.some((e) => e.path === p);
+
   async function newFolder() {
     const name = await prompt("New folder", "", { label: "Folder name", ok: "Create" }); if (!name) return;
-    await guard(async () => { await api("/api/mkdir", { method: "POST", body: { path: joinp(st.path, name) } }); await reload(); loadStatus(); });
+    const dir = st.path, p = joinp(dir, name);
+    if (exists(p)) return toast("“" + name + "” already exists here", "bad");
+    st.flash = p;
+    await optimistic(() => addLocal(dir, { name, path: p, dir: true, size: 0, mtime: Date.now() / 1000, kind: "dir", items: 0, enc: false, pending: true }),
+      () => api("/api/mkdir", { method: "POST", body: { path: p } }));
   }
   async function newFile() {
     const name = await prompt("New file", "untitled.txt", { label: "File name", ok: "Create", stem: true }); if (!name) return;
-    await guard(async () => { const p = joinp(st.path, name); await api("/api/newfile", { method: "POST", body: { path: p } }); await reload(); const e = st.entries.find((x) => x.path === p); if (e) editPath(e); });
+    const dir = st.path, p = joinp(dir, name);
+    if (exists(p)) return toast("“" + name + "” already exists here", "bad");
+    st.flash = p;
+    await optimistic(() => addLocal(dir, { name, path: p, dir: false, size: 0, mtime: Date.now() / 1000, kind: "text", enc: false, parts: 1, mime: "text/plain", pending: true }),
+      () => api("/api/newfile", { method: "POST", body: { path: p } }).then((r) => { window.Editor.open(p, name.split("/").pop(), () => reload()); return r; }));   // editor opens the moment it exists
   }
   async function rename(e) {
     const name = await prompt("Rename", e.name, { label: "New name", ok: "Rename", stem: !e.dir }); if (!name || name === e.name) return;
-    await guard(async () => { await api("/api/rename", { method: "POST", body: { path: e.path, name } }); st.sel = []; await reload(); });
+    if (name.includes("/")) return toast("A name can't contain “/”", "bad");
+    const np = joinp(parentOf(e.path), name);
+    if (exists(np)) return toast("“" + name + "” already exists here", "bad");
+    st.flash = np;
+    await optimistic(() => { st.entries = st.entries.map((x) => (x.path === e.path ? Object.assign({}, x, { name, path: np, pending: true }) : x)); st.sel = []; render(); },
+      () => api("/api/rename", { method: "POST", body: { path: e.path, name } }));
   }
-  async function del(es) {
+  async function del(es, forever) {
+    const permanent = !!forever || !trashOn();
     const what = es.length === 1 ? `“${es[0].name}”` : `${es.length} items`;
-    const mode = await choose("Delete " + what + "?", "Move to the trash so you can restore it later, or delete it permanently.",
-      [{ label: "Delete forever", kind: "danger", value: "perm" }, { label: "Move to trash", kind: "primary", value: "trash" }]);
-    if (!mode) return;
-    // The list updates at once; GitHub is told in the background and the list is re-synced afterwards.
-    const gone = new Set(es.map((x) => x.path));
-    st.entries = st.entries.filter((e) => !gone.has(e.path)); st.sel = []; render();
-    const x = newXfer((mode === "perm" ? "Deleting " : "Moving to trash: ") + what); x.msg = "Saving to GitHub…"; x.progress = 0.3; renderXfer();
-    try {
-      await api("/api/delete", { method: "POST", body: { paths: es.map((y) => y.path), permanent: mode === "perm" } });
-      x.state = "done"; x.progress = 1; x.msg = ""; renderXfer();
-      toast(mode === "perm" ? "Deleted" : "Moved to trash");
-    } catch (e) { x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad"); }
-    reload(); loadStatus();
+    // Moving to the trash needs no question: it is instant and undoable. Only "forever" asks first.
+    if (permanent && !(await ask("Delete " + what + " forever?", "This can't be undone.", { ok: "Delete forever", danger: true }))) return;
+    const gone = new Set(es.map((x) => x.path)), dir = st.path;
+    await optimistic(() => { st.entries = st.entries.filter((e) => !gone.has(e.path)); st.sel = []; render(); },
+      () => api("/api/delete", { method: "POST", body: { paths: [...gone], permanent } }).then((r) => {
+        const ids = ((r && r.results) || []).map((x) => x.trash_id).filter(Boolean);
+        if (permanent || !ids.length) toast("Deleted " + what);
+        else toast("Moved " + what + " to trash", "ok", 8000, { label: "Undo", run: () => undo(ids, es, dir) });
+        return r;
+      }));
+  }
+  function undo(ids, es, dir) {
+    return optimistic(() => { if (st.mode === "files" && st.path === dir) { st.entries = st.entries.concat(es.map((e) => Object.assign({}, e, { pending: true }))); render(); } },
+      () => api("/api/trash/restore", { method: "POST", body: { ids } }).then((r) => { toast("Restored"); return r; }));
   }
   function setClip(cut) { st.clip = { paths: st.sel.slice(), cut }; paint(); el.paste.hidden = false; toast(`${st.clip.paths.length} item(s) ${cut ? "cut" : "copied"}`); }
   async function doPaste(into) {
     if (!st.clip) return;
     const dest = typeof into === "string" ? into : st.path, clip = st.clip;
-    await guard(async () => {
-      const ex = await api("/api/exists", { method: "POST", body: { paths: clip.paths.map((p) => joinp(dest, p.split("/").pop())) } });
-      let pol = "rename";
-      if (ex.existing.length && clip.cut === false || ex.existing.length && clip.cut) {
-        pol = await choose("Name conflict", `${ex.existing.length} item(s) already exist in the destination.`, [{ label: "Skip", value: "skip" }, { label: "Keep both", value: "rename" }, { label: "Replace", kind: "danger", value: "replace" }]);
-        if (!pol) return;
-      }
-      await api("/api/move", { method: "POST", body: { paths: clip.paths, dest, copy: !clip.cut, on_conflict: pol } });
-      if (clip.cut) st.clip = null;
-      toast(clip.cut ? "Moved" : "Copied"); await reload(); loadStatus();
-    });
+    const ex = await guard(() => api("/api/exists", { method: "POST", body: { paths: clip.paths.map((p) => joinp(dest, p.split("/").pop())) } })); if (!ex) return;
+    let pol = "rename";
+    if (ex.existing.length) {
+      pol = await choose("Name conflict", `${ex.existing.length} item(s) already exist in the destination.`, [{ label: "Skip", value: "skip" }, { label: "Keep both", value: "rename" }, { label: "Replace", kind: "danger", value: "replace" }]);
+      if (!pol) return;
+    }
+    await optimistic(null, () => api("/api/move", { method: "POST", body: { paths: clip.paths, dest, copy: !clip.cut, on_conflict: pol } })
+      .then((r) => { if (clip.cut) st.clip = null; toast(clip.cut ? "Moved" : "Copied"); return r; }));
   }
   function downloadSel(es) {
     if (es.length === 1 && !es[0].dir) { const a = h("a", { href: "/api/raw?download=1&path=" + enc(es[0].path), download: es[0].name }); document.body.append(a); a.click(); a.remove(); return; }
@@ -484,29 +576,30 @@
   async function extract(e) { const r = await guard(() => api("/api/extract", { method: "POST", body: { path: e.path } })); if (r) trackJob(r.job); }
 
   // ------------------------------------------------------------ search
+  let searchSeq = 0;
   async function onSearch() {
-    const q = el.search.value.trim(); st.query = q;
+    const q = el.search.value.trim(); st.query = q; const seq = ++searchSeq;
     if (!q) { st.mode = "files"; return reload(); }
     const d = await guard(() => api("/api/search?q=" + enc(q) + "&path=" + enc(st.mode === "search" ? "/" : st.path)));
-    if (!d) return;
+    if (!d || seq !== searchSeq) return;
     st.mode = "search"; st.entries = d.entries; st.sel = []; st.loadErr = ""; render();
   }
 
   // ------------------------------------------------------------ trash
   async function showTrash() {
-    st.mode = "trash"; st.sel = []; st.tsel = new Set();
-    const d = await guard(() => api("/api/trash")); st.trash = d ? d.items : [];
+    st.mode = "trash"; st.sel = []; st.tsel = new Set(); loadSeq++;
     renderCrumbs(); el.nav.files.classList.remove("on"); el.nav.trash.classList.add("on"); el.paste.hidden = true; el.viewSeg.hidden = true; el.selBar.hidden = true;
+    drawTrash();                                       // instant: what we knew last time, or "Loading…" on the very first visit
+    const d = await guard(() => api("/api/trash"));
+    if (st.mode !== "trash") return;
+    if (d) { st.trash = d.items; st.trashLoaded = true; }
     drawTrash();
   }
-  // Runs a trash action: rows vanish immediately, GitHub is updated in the background, list re-synced after.
+  // Rows vanish immediately, GitHub is updated in the background, the list is re-synced when it's done.
   async function trashAct(ids, url, label, okMsg) {
     const gone = new Set(ids);
-    st.trash = st.trash.filter((t) => !gone.has(t.id)); st.tsel = new Set(); drawTrash();
-    const x = newXfer(label); x.msg = "Saving to GitHub…"; x.progress = 0.3; renderXfer();
-    try { await api(url, { method: "POST", body: { ids } }); x.state = "done"; x.progress = 1; x.msg = ""; renderXfer(); toast(okMsg); }
-    catch (e) { x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad"); }
-    await showTrash(); loadStatus();
+    await optimistic(() => { st.trash = st.trash.filter((t) => !gone.has(t.id)); st.tsel = new Set(); drawTrash(); },
+      () => api(url, { method: "POST", body: { ids } }).then((r) => { toast(okMsg); return r; }));
   }
   function drawTrash() {
     el.selBar.hidden = true; el.list.className = "";
@@ -526,23 +619,64 @@
           btn("Restore", "restore", () => trashAct([t.id], "/api/trash/restore", "Restoring " + t.name, "Restored to " + t.path)),
           btn("", "trash", async () => { if (await ask("Delete forever?", `“${t.name}” will be removed permanently.`, { ok: "Delete", danger: true })) trashAct([t.id], "/api/trash/empty", "Deleting " + t.name, "Deleted"); }, "danger icon", "Delete forever")));
     });
-    el.list.replaceChildren(...(rows.length ? [tool, ...rows] : [h("div", { class: "empty" }, icon("trash"), h("div", null, "The trash is empty."))]));
-    renderCrumbs();
+    el.list.replaceChildren(...(!st.trashLoaded ? [h("div", { class: "empty" }, "Loading…")] : rows.length ? [tool, ...rows] : [h("div", { class: "empty" }, icon("trash"), h("div", null, "The trash is empty."))]));
+    renderCrumbs(); renderStatus();
   }
 
   // ------------------------------------------------------------ uploads
   const xfers = [];
   function renderXfer() {
-    const live = xfers.filter((x) => x.state === "run" || st.xferOpen);
     el.xfer.hidden = !xfers.length;
     if (!xfers.length) return;
     const running = xfers.filter((x) => x.state === "run").length;
     el.xfer.replaceChildren(
       h("header", { onclick: () => { st.xferOpen = !st.xferOpen; renderXfer(); } }, h("span", null, running ? `Transfers (${running} running)` : "Transfers"),
         h("span", { style: { display: "flex", gap: "6px" } }, !running ? h("button", { class: "btn ghost icon", type: "button", "aria-label": "Clear", onclick: (e) => { e.stopPropagation(); xfers.length = 0; renderXfer(); } }, icon("trash")) : null, h("span", null, st.xferOpen ? "▾" : "▴"))),
-      st.xferOpen ? h("div", { class: "items" }, ...xfers.slice().reverse().map((x) => h("div", { class: "xi " + x.state }, h("div", { class: "t" }, h("span", null, x.title), h("span", { class: "muted" }, x.state === "err" ? "failed" : x.state === "done" ? "done" : Math.round(x.progress * 100) + "%")), h("div", { class: "meter" }, h("i", { style: { width: Math.round(x.progress * 100) + "%" } })), h("div", { class: "muted", style: { fontSize: "12px" } }, x.msg || "")))) : null);
+      st.xferOpen ? h("div", { class: "items" }, ...xfers.slice().reverse().map(xferRow)) : null);
+    xfers.forEach(paintX); kick();
   }
-  function newXfer(title) { const x = { title, progress: 0, state: "run", msg: "" }; xfers.push(x); st.xferOpen = true; renderXfer(); return x; }
+  function xferRow(x) {
+    const pct = h("span", { class: "muted" }), bar = h("i"), msg = h("div", { class: "muted", style: { fontSize: "12px" } });
+    x.dom = { pct, bar, msg };
+    return h("div", { class: "xi " + x.state }, h("div", { class: "t" }, h("span", null, x.title), pct), h("div", { class: "meter" }, bar), msg);
+  }
+  // Only the bar, the percentage and the message are touched per frame; the panel is rebuilt only when something is added or finishes.
+  function paintX(x) {
+    if (!x.dom) return;
+    const v = x.m.shown;
+    x.dom.bar.style.transform = "scaleX(" + v.toFixed(4) + ")";
+    const t = x.state === "err" ? "failed" : x.state === "done" && v >= 1 ? "done" : Math.round(v * 100) + "%";
+    if (x.dom.pct.textContent !== t) x.dom.pct.textContent = t;
+    if (x.dom.msg.textContent !== (x.msg || "")) x.dom.msg.textContent = x.msg || "";
+  }
+  let raf = 0;
+  function frame(now) {
+    raf = 0; let live = false;
+    for (const x of xfers) { if (x.state === "run" || (x.state === "done" && x.m.shown < 1)) { PR.step(x.m, now); live = true; } paintX(x); }
+    if (live) raf = requestAnimationFrame(frame);
+  }
+  function kick() { if (!raf && xfers.some((x) => x.state === "run" || (x.state === "done" && x.m.shown < 1))) raf = requestAnimationFrame(frame); }
+  function newXfer(title) { const x = { title, state: "run", msg: "", m: PR.meter(performance.now()), dom: null }; xfers.push(x); st.xferOpen = true; renderXfer(); return x; }
+  function xprog(x, v, msg, headroom) { PR.report(x.m, v, performance.now(), headroom); if (msg !== undefined) x.msg = msg; kick(); }
+  function xdone(x) { x.state = "done"; x.msg = ""; PR.finish(x.m); renderXfer(); }
+  function xfail(x, msg) { x.state = "err"; x.msg = msg; renderXfer(); }
+
+  // One chunk via XHR: unlike fetch it reports bytes as they leave the browser, so the bar moves smoothly instead of per 16 MB chunk.
+  function putChunk(url, blob, onBytes) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url); xhr.withCredentials = true; xhr.setRequestHeader("X-CSRF-Token", S.csrf);
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onBytes(e.loaded); };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) return resolve();
+        let m = xhr.statusText; try { m = JSON.parse(xhr.responseText).error || m; } catch (e) { /* not json */ }
+        reject(Object.assign(new Error(m || "Upload failed"), { fatal: xhr.status < 500 && xhr.status !== 429 }));
+      };
+      xhr.onerror = () => reject(new Error("Can't reach the server. Check your connection."));
+      xhr.onabort = () => reject(Object.assign(new Error("Upload cancelled"), { fatal: true }));
+      xhr.send(blob);
+    });
+  }
 
   const CHUNK = 8 * 1024 * 1024;
   async function uploadFiles(items, dirs) {
@@ -571,44 +705,44 @@
         // huge file saturates the connection. The server puts the pieces back in order.
         const tasks = [];
         batch.forEach((f) => { for (let off = 0; off < f.file.size || (off === 0 && f.file.size === 0); off += CH) { tasks.push({ f, off }); if (f.file.size === 0) break; } });
-        let sent = 0, next = 0, t0 = performance.now();
+        let next = 0, doneBytes = 0;
+        const live = new Map(), speed = PR.rateTracker(4000);
+        const report = () => {
+          let sent = doneBytes; live.forEach((n) => { sent += n; }); sent = Math.min(sent, total);
+          PR.sample(speed, performance.now(), sent);
+          xprog(x, (sent / total) * 0.9, `Uploading ${fmtBytes(sent)} of ${fmtBytes(total)} · ${fmtBytes(PR.rate(speed))}/s`, 0.025);
+        };
         const worker = async () => {
           while (next < tasks.length) {
-            const { f, off } = tasks[next++];
-            const blob = f.file.slice(off, off + CH);
+            const { f, off } = tasks[next++], key = f.id + ":" + off, blob = f.file.slice(off, off + CH);
             for (let tries = 0; ; tries++) {
-              try {
-                const r = await fetch(`/api/upload/${begin.batch}/${f.id}?offset=${off}`, { method: "PUT", headers: { "X-CSRF-Token": S.csrf }, body: blob, credentials: "same-origin" });
-                if (!r.ok) { let m = r.statusText; try { m = (await r.json()).error || m; } catch (e) { /* */ } const er = new Error(m); er.fatal = r.status < 500 && r.status !== 429; throw er; }
-                break;
-              } catch (e) { if (e.fatal || tries >= 4) throw e; await new Promise((r) => setTimeout(r, 600 * (tries + 1))); }
+              try { await putChunk(`/api/upload/${begin.batch}/${f.id}?offset=${off}`, blob, (n) => { live.set(key, n); report(); }); break; }
+              catch (e) { live.delete(key); if (e.fatal || tries >= 4) throw e; await new Promise((r) => setTimeout(r, 600 * (tries + 1))); }
             }
-            sent += blob.size;
-            const sp = sent / Math.max(0.5, (performance.now() - t0) / 1000);
-            x.progress = (sent / total) * 0.9; x.msg = `Uploading ${fmtBytes(sent)} of ${fmtBytes(total)} · ${fmtBytes(sp)}/s`; renderXfer();
+            live.delete(key); doneBytes += blob.size; report();
           }
         };
         await Promise.all([worker(), worker(), worker(), worker()]);
-        x.msg = "Finishing on GitHub…"; x.progress = 0.92; renderXfer();
+        xprog(x, 0.92, "Finishing on GitHub…", 0.06);
         const r = await api(`/api/upload/${begin.batch}/commit`, { method: "POST", body: { files: batch.map((f) => ({ id: f.id, path: f.path, mtime: f.mtime })), dirs: b === 0 ? dirs || [] : [], on_conflict: policy } });
         await followJob(r.job, x, 0.92);
       } catch (e) {
-        x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad");
+        xfail(x, e.message); toast(e.message, "bad");
         if (begin && begin.batch) api(`/api/upload/${begin.batch}/cancel`, { method: "POST", body: {} }).catch(() => {});
       }
     }
-    reload(); loadStatus();
+    invalidate(); reload(); loadStatus();
   }
   async function followJob(job, x, base) {
     for (;;) {
       const j = await api("/api/jobs/" + job.id);
-      x.progress = base + j.progress * (1 - base); x.msg = j.message || ""; renderXfer();
-      if (j.state === "done") { x.state = "done"; x.progress = 1; x.msg = ""; renderXfer(); return j; }
-      if (j.state === "error") { x.state = "err"; x.msg = j.error; renderXfer(); throw new Error(j.error); }
-      await new Promise((r) => setTimeout(r, 900));
+      xprog(x, base + j.progress * (1 - base), j.message || x.msg, 0.04);
+      if (j.state === "done") { xdone(x); return j; }
+      if (j.state === "error") { xfail(x, j.error); throw new Error(j.error); }
+      await new Promise((r) => setTimeout(r, 500));
     }
   }
-  async function trackJob(job) { const x = newXfer(job.title); try { await followJob(job, x, 0); toast(job.title + " finished"); reload(); loadStatus(); } catch (e) { toast(e.message, "bad"); } }
+  async function trackJob(job) { const x = newXfer(job.title); try { await followJob(job, x, 0); toast(job.title + " finished"); invalidate(); reload(); loadStatus(); } catch (e) { toast(e.message, "bad"); } }
 
   // ------------------------------------------------------------ drag & drop
   function bindDrop() {
@@ -626,7 +760,9 @@
       if (!dest) return;
       const paths = JSON.parse(mv).filter((p) => p !== dest && !dest.startsWith(p + "/"));
       if (!paths.length) return;
-      await guard(async () => { await api("/api/move", { method: "POST", body: { paths, dest, on_conflict: "rename" } }); toast("Moved"); st.sel = []; await reload(); });
+      const moved = new Set(paths);
+      await optimistic(() => { st.entries = st.entries.filter((x) => !moved.has(x.path)); st.sel = []; render(); },
+        () => api("/api/move", { method: "POST", body: { paths, dest, on_conflict: "rename" } }).then((r) => { toast("Moved"); return r; }));
     });
     el.list.addEventListener("dragstart", (e) => {
       const row = e.target.closest(".row"); if (!row) return;

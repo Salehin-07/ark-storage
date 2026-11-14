@@ -18,6 +18,8 @@ const files = [
   { name: "doc.pdf", path: "/doc.pdf", dir: false, size: 5e5, mtime: 1700000300, kind: "pdf", enc: false, parts: 1, mime: "application/pdf" },
   { name: "x.zip", path: "/x.zip", dir: false, size: 99, mtime: 1700000400, kind: "archive", enc: false, parts: 1, mime: "application/zip" },
 ];
+let slow = 0;
+const later = (o, ms) => new Promise((r) => setTimeout(() => r(o), ms));
 const json = (o, s = 200) => Promise.resolve({ ok: s < 400, status: s, statusText: "", json: async () => o });
 w.fetch = (url, init = {}) => {
   calls.push((init.method || "GET") + " " + url);
@@ -29,6 +31,8 @@ w.fetch = (url, init = {}) => {
     case "/api/status": return json({ version: "1.0.0", problems: [], branch: "ark-data", private: false, repo: "me/r", repo_kb: 100, git: true, crypto: { enabled: false, passphrase_set: false, initialised: false }, stats: { files: 5, folders: 1, bytes: 123456, trash_items: 1 }, cache_bytes: 0 });
     case "/api/text": return json({ path: "/a.txt", content: "hello\nworld", size: 11, sha: "s1" });
     case "/api/settings": return json({ settings: { repo_url: { kind: "str", value: "me/r", source: "env", secret: false }, token: { kind: "str", value: "", set: true, source: "env", secret: true }, branch: { kind: "str", value: "ark-data", source: "default" }, encrypt: { kind: "bool", value: false, source: "default" }, passphrase: { kind: "str", value: "", set: false, secret: true, source: "default" }, chunk_mb: { kind: "int", value: 48, min: 1, max: 95, source: "default" }, stage_mb: { kind: "int", value: 48, min: 1, max: 95, source: "default" }, cache_mb: { kind: "int", value: 1024, min: 64, max: 99, source: "default" }, max_upload_mb: { kind: "int", value: 20480, min: 0, max: 99, source: "default" }, refresh_seconds: { kind: "int", value: 10, min: 0, max: 99, source: "default" }, trash: { kind: "bool", value: true, source: "default" }, show_hidden: { kind: "bool", value: false, source: "default" }, share_hours: { kind: "int", value: 24, min: 1, max: 99, source: "default" }, theme: { kind: "str", value: "auto", choices: ["auto", "light", "dark"], source: "default" }, session_hours: { kind: "int", value: 168, min: 1, max: 99, source: "default" }, commit_name: { kind: "str", value: "Ark", source: "default" }, commit_email: { kind: "str", value: "a@b.c", source: "default" } }, problems: [] });
+    case "/api/mkdir": return later({ ok: true, status: 200, statusText: "", json: async () => ({ ok: true }) }, slow);
+    case "/api/delete": return later({ ok: true, status: 200, statusText: "", json: async () => ({ ok: true, results: [{ path: "/a.txt", trash_id: "t1" }] }) }, slow);
     case "/api/trash": return json({ items: [{ id: "1", name: "old.txt", path: "/old.txt", dir: false, ts: 1700000000, size: 3 }] });
     default: return json({ ok: true });
   }
@@ -36,7 +40,7 @@ w.fetch = (url, init = {}) => {
 const load = (f) => w.eval(fs.readFileSync(path.join(root, f), "utf8"));
 const errors = [];
 w.addEventListener("error", (e) => errors.push(e.message));
-["files-core.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "app.js"].forEach(load);
+["files-core.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "progress.js", "app.js"].forEach(load);
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 const q = (s) => w.document.querySelector(s), qa = (s) => [...w.document.querySelectorAll(s)];
 let fails = 0;
@@ -51,6 +55,9 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   ok(qa(".row").length === files.length, "rows rendered: " + qa(".row").length);
   ok(q("#banner") && !q("#banner").hidden && /default password/.test(q("#banner").textContent), "default-password banner");
   const rows = qa(".row");
+  ok(!q("#top .brand-s") && !q("#top img"), "no logo or title in the top bar");
+  ok(!q("#top .spacer"), "no spacer next to the search box (it takes all free width)");
+  ok(q("#search").nextElementSibling && q("#search").nextElementSibling.tagName === "BUTTON", "search box is followed directly by the buttons");
   rows[1].click(); await tick();
   ok(rows[1].classList.contains("sel") && !q("#sel-bar").hidden, "click selects, action bar appears");
   rows[2].dispatchEvent(new w.MouseEvent("click", { bubbles: true, ctrlKey: true })); await tick();
@@ -73,6 +80,25 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   ta.dispatchEvent(new w.KeyboardEvent("keydown", { key: "(", bubbles: true, cancelable: true }));
   ok(true, "editor keydown handled without throwing");
   q("#editor .btn:last-child").click(); await tick(); q(".scrim") && q(".scrim").remove(); q("#editor") && q("#editor").remove();
+  // ---- instant feedback: the new folder is on screen before GitHub has answered
+  slow = 400;
+  q("#fab").click(); await tick();
+  const items = qa(".menu button"); items.find((b) => /New folder/.test(b.textContent)).click(); await tick(60);
+  q(".dlg input").value = "Photos"; qa(".dlg footer .primary")[0].click(); await tick(40);
+  const newRow = qa("#list .row").find((r) => r.dataset.path === "/Photos");
+  ok(!!newRow && newRow.classList.contains("pending"), "new folder appears immediately, marked as saving (API still pending)");
+  ok(q("#sync").classList.contains("on") && /Saving/.test(q("#status").textContent), "sync bar and status show it is saving");
+  await tick(700);
+  ok(!q("#sync").classList.contains("on"), "sync bar clears when GitHub has answered");
+  // ---- trash is instant and undoable (no confirmation dialog)
+  const before = qa("#list .row").length;
+  qa("#list .row").find((r) => r.dataset.path === "/a.txt").click(); await tick();
+  const delBtn = qa("#sel-bar button").find((b) => /Delete/.test(b.textContent)); delBtn.click(); await tick(40);
+  ok(!q(".dlg"), "moving to trash asks nothing");
+  ok(qa("#list .row").length === before - 1 && !qa("#list .row").some((r) => r.dataset.path === "/a.txt"), "item leaves the list immediately");
+  await tick(700);
+  ok(!!q(".toast-act") && /Undo/.test(q(".toast-act").textContent), "an Undo button is offered after the move");
+  slow = 0;
   q("#side .nav:nth-child(3)").click(); await tick(150);
   ok(!!q(".dlg") && /Repository/.test(q(".dlg").textContent), "settings dialog opens");
   qa(".set-nav button").forEach((b) => b.click());

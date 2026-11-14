@@ -67,8 +67,9 @@
   }
 
   // ---- toasts -------------------------------------------------------------
-  function toast(msg, kind, ms) {
-    const el = h("div", { class: "toast" + (kind === "bad" ? " bad" : ""), role: "status" }, msg);
+  function toast(msg, kind, ms, action) {
+    const el = h("div", { class: "toast" + (kind === "bad" ? " bad" : ""), role: "status" }, h("span", { class: "msg" }, msg));
+    if (action) el.append(h("button", { class: "toast-act", type: "button", onclick: () => { el.remove(); action.run(); } }, action.label));
     document.getElementById("toasts").append(el);
     setTimeout(() => el.remove(), ms || (kind === "bad" ? 6000 : 3200));
   }

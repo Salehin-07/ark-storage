@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="Ark Storage" width="180"></p>
+
 # Ark Storage
 
 **Your own cloud drive, stored in a GitHub repository.** Upload, browse, edit, preview and share files from any

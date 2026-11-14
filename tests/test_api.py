@@ -176,10 +176,49 @@ class ApiTests(unittest.TestCase):
             a = Api(st, remote)
             html = a.c.get("/").get_data(as_text=True)
             self.assertIn("Ark Storage", html)
-            for js in ("files-core.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "app.js", "style.css"):
+            for js in ("files-core.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "progress.js", "app.js", "style.css"):
                 self.assertEqual(a.c.get("/static/" + js).status_code, 200, js)
             self.assertEqual(a.c.get("/static/../app.py").status_code, 404)
             self.assertEqual(a.c.get("/healthz").get_json()["ok"], True)
+
+    def test_assets_logo_cache_and_gzip(self):
+        with sandbox() as (st, remote):
+            a = Api(st, remote)
+            html = a.c.get("/").get_data(as_text=True)
+            self.assertNotIn("icon.svg", html)
+            for png in ("icon-32.png", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"):
+                r = a.c.get("/static/" + png)
+                self.assertEqual((r.status_code, r.mimetype), (200, "image/png"), png)
+            self.assertEqual(a.c.get("/favicon.ico").status_code, 200)
+            icons = a.c.get("/manifest.webmanifest").get_json()["icons"]
+            self.assertTrue(icons and all(i["type"] == "image/png" for i in icons))
+            # versioned static URLs are cached for good, unversioned ones are revalidated
+            self.assertIn("immutable", a.c.get("/static/app.js?v=1").headers["Cache-Control"])
+            self.assertEqual(a.c.get("/static/app.js").headers["Cache-Control"], "no-cache")
+            # text is gzipped when the browser accepts it, and is identical once decoded
+            import gzip
+            raw = a.c.get("/static/app.js").get_data()
+            z = a.c.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
+            self.assertEqual(z.headers.get("Content-Encoding"), "gzip")
+            self.assertEqual(gzip.decompress(z.get_data()), raw)
+            self.assertLess(len(z.get_data()), len(raw) // 2)
+            self.assertIsNone(a.c.get("/static/app.js").headers.get("Content-Encoding"))
+            png = a.c.get("/static/icon-512.png", headers={"Accept-Encoding": "gzip"})
+            self.assertIsNone(png.headers.get("Content-Encoding"))      # already compressed: left alone
+
+    def test_trash_ids_for_undo(self):
+        with sandbox() as (st, remote):
+            a = Api(st, remote)
+            a.login()
+            self.assertEqual(a.call("post", "/api/newfile", json={"path": "/u.txt", "content": "x"}).status_code, 200)
+            r = a.call("post", "/api/delete", json={"paths": ["/u.txt"]}).get_json()
+            tid = r["results"][0]["trash_id"]
+            self.assertTrue(tid)
+            self.assertTrue(a.call("get", "/api/status").get_json()["trash"])
+            self.assertEqual(a.call("post", "/api/trash/restore", json={"ids": [tid]}).status_code, 200)
+            names = [e["name"] for e in a.call("get", "/api/list?path=/").get_json()["entries"]]
+            self.assertIn("u.txt", names)
+            self.assertIsNone(a.call("post", "/api/delete", json={"paths": ["/u.txt"], "permanent": True}).get_json()["results"][0]["trash_id"])
 
 
 if __name__ == "__main__":
