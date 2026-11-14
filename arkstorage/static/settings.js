@@ -77,8 +77,9 @@
       perf() {
         return card("Performance & limits", "Defaults suit most setups. Pieces must stay under GitHub's 100 MB per-file limit.",
           row("chunk_mb", "Piece size (MB)", "Files larger than this are split into pieces and joined again on download. 1–95.", num("chunk_mb")),
+          row("stage_mb", "Push batch (MB)", "While uploading, data is pushed to GitHub in batches of about this size so the server never holds a whole file. Lower = less disk and RAM needed, higher = fewer pushes.", num("stage_mb")),
           row("cache_mb", "Download cache (MB)", "Recently opened pieces are kept on this server's disk so repeat views are instant.", num("cache_mb")),
-          row("max_upload_mb", "Upload limit per file (MB)", "0 = no limit. The server needs about twice a file's size in free disk while it uploads.", num("max_upload_mb")),
+          row("max_upload_mb", "Upload limit per file (MB)", "0 = no limit. Files stream to GitHub while they upload, so the server only needs a few hundred MB of free disk, however big the file.", num("max_upload_mb")),
           row("refresh_seconds", "Re-check GitHub every (s)", "How long a folder listing is trusted before asking GitHub for changes. 0 = every time.", num("refresh_seconds")));
       },
       beh() {
@@ -151,5 +152,84 @@
     return dlg;
   }
 
-  window.Settings = { open };
+  // First-run guide: shown right after sign-in when no repository/token is configured yet.
+  async function setup(hooks) {
+    hooks = hooks || {};
+    let S;
+    try { S = (await api("/api/settings")).settings; } catch (e) { toast(e.message, "bad"); return; }
+    let closeDlg = null, connected = null;
+    const body = h("div");
+    const msg = h("div", { class: "err", role: "alert", style: { marginTop: "8px" } });
+    const inp = (o) => h("input", Object.assign({ class: "inp", spellcheck: false, autocapitalize: "none", autocomplete: "off" }, o));
+    const field = (label, hint, ctl) => h("div", { class: "field", style: { marginBottom: "12px" } }, h("label", { class: "lbl" }, label), ctl, hint ? h("div", { class: "hint", style: { marginTop: "4px" } }, hint) : null);
+    const repo = inp({ value: S.repo_url.value || "", placeholder: "https://github.com/you/your-storage" });
+    const token = inp({ type: "password", autocomplete: "new-password", placeholder: S.token.set ? "•••••••• (already set — leave empty to keep)" : "github_pat_…" });
+    const branch = inp({ value: S.branch.value || "ark-data", placeholder: "ark-data" });
+    const go = h("button", { class: "btn primary", type: "button", onclick: () => run(go, step === 1 ? connect : finish) }, "Connect");
+    let step = 1;
+    const foot = h("div", { style: { display: "flex", flex: 1, justifyContent: "flex-end" } }, go);
+
+    async function run(b, fn) {
+      msg.textContent = ""; b.disabled = true; const old = b.textContent; b.textContent = "Working…";
+      try { await fn(); } catch (e) { msg.textContent = e.message; } finally { b.disabled = false; b.textContent = old; if (step === 2) b.textContent = "Finish"; }
+    }
+    async function connect() {
+      const changes = { repo_url: repo.value.trim(), branch: branch.value.trim() };
+      if (!changes.repo_url) throw new Error("Enter your repository, for example you/your-storage.");
+      if (token.value.trim()) changes.token = token.value.trim();
+      else if (!S.token.set) throw new Error("Paste a GitHub access token.");
+      await api("/api/settings", { method: "PUT", body: { changes } });
+      const r = await api("/api/settings/test", { method: "POST", body: {} });
+      if (r.can_push === false) throw new Error("Connected to " + r.repo + ", but this token can only read. Give it Contents: Read and write.");
+      connected = r; S.token.set = true;
+      if (hooks.defaultPw || r.private === false) { step = 2; drawStep(); return; }
+      done();
+    }
+    const nu = inp({ placeholder: "Keep “ark”", autocomplete: "username" });
+    const np = inp({ type: "password", autocomplete: "new-password" }), np2 = inp({ type: "password", autocomplete: "new-password" });
+    const encSw = h("input", { type: "checkbox", role: "switch" }), phrase = inp({ type: "password", autocomplete: "new-password", placeholder: "Choose a long passphrase" });
+    async function finish() {
+      if (hooks.defaultPw && (np.value || nu.value.trim())) {
+        if (np.value !== np2.value) throw new Error("The two passwords don't match.");
+        const r = await api("/api/account", { method: "POST", body: { current: "ark", username: nu.value.trim(), password: np.value } });
+        if (hooks.account) hooks.account(r.user);
+      }
+      if (encSw.checked) {
+        if (!phrase.value) throw new Error("Enter a passphrase, or turn encryption off.");
+        await api("/api/settings", { method: "PUT", body: { changes: { encrypt: true, passphrase: phrase.value } } });
+      }
+      done();
+    }
+    function done() { toast("Ark Storage is ready"); if (closeDlg) closeDlg(true); if (hooks.done) hooks.done(); }
+    function drawStep() {
+      go.textContent = step === 1 ? "Connect" : "Finish";
+      if (step === 1) {
+        body.replaceChildren(
+          h("p", { style: { margin: "0 0 12px" } }, "Ark Storage keeps your files in a GitHub repository you own. Connect one to get started — it takes a minute."),
+          field("Repository", "owner/repo or the full URL. A private, empty repository is best.", repo),
+          field("Access token", "A fine-grained token with Contents: Read and write on that one repository.", token),
+          h("details", { style: { marginBottom: "12px" } }, h("summary", { class: "muted", style: { cursor: "pointer" } }, "How do I get a token?"),
+            h("ol", { class: "hint", style: { margin: "6px 0 0 18px", padding: 0 } },
+              h("li", null, "Open ", h("a", { href: "https://github.com/settings/personal-access-tokens/new", target: "_blank", rel: "noopener" }, "GitHub → Settings → Fine-grained tokens → Generate"), "."),
+              h("li", null, "Repository access: only select repositories → pick your storage repo."),
+              h("li", null, "Permissions → Contents: Read and write. Generate, copy, paste above."))),
+          h("details", { style: { marginBottom: "4px" } }, h("summary", { class: "muted", style: { cursor: "pointer" } }, "Advanced"), field("Storage branch", "Files live on their own branch, created automatically.", branch)),
+          msg);
+      } else {
+        body.replaceChildren(
+          h("p", { style: { margin: "0 0 12px" } }, `Connected to ${connected.repo}. Two quick things before you start:`),
+          hooks.defaultPw ? h("div", { class: "card" }, h("h3", null, "Change the default sign-in"), h("div", { class: "hint" }, "You are still using ark / ark. Anyone who finds this server could sign in."),
+            field("Username", "", nu), field("New password", "At least 4 characters.", np), field("Repeat password", "", np2)) : null,
+          h("div", { class: "card", style: connected.private === false ? { borderColor: "var(--warn)" } : null }, h("h3", null, "Encrypt your files"),
+            h("div", { class: "hint" }, connected.private === false ? "This repository is PUBLIC: without encryption anyone can read your files." : "Optional. Files are encrypted on this server before they reach GitHub."),
+            h("label", { style: { display: "flex", gap: "8px", alignItems: "center", margin: "10px 0" } }, encSw, "Encrypt new files"),
+            field("Passphrase", "Never shown again. If you lose it, encrypted files cannot be recovered.", phrase)),
+          msg);
+      }
+    }
+    drawStep();
+    await modal({ title: "Welcome to Ark Storage", body, footExtra: foot, buttons: [{ label: "Skip for now", value: null }], dismiss: false, ready: (d, close) => { closeDlg = close; } });
+  }
+
+  window.Settings = { open, setup };
 })();

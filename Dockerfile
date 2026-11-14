@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+LABEL org.opencontainers.image.source="https://github.com/Salehin-07/ark-storage" \
+      org.opencontainers.image.description="Ark Storage: your own cloud drive, stored in a GitHub repository" \
+      org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

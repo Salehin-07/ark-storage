@@ -3,15 +3,19 @@ import base64
 import contextlib
 import io
 import json
+import logging
 import os
 import secrets
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config, crypto, vfs
 from .gh import EMPTY_BLOB, Client, Git, GitHubError, NonFastForward
 from .vfs import FILES, META, CONF, TRASH, TRASH_META, SUF_PARTS, VfsError
+
+STAGE = ".ark/staging/"      # pieces pushed early while an upload is still arriving; removed by its final commit
 
 README = (b"# Ark Storage data\n\nThis branch is managed by [Ark Storage](https://github.com/Salehin-07/ark-storage).\n"
           b"Your files live under `files/` (large files are split into `*.arkparts/` pieces, encrypted ones end in "
@@ -90,13 +94,16 @@ class Reader:
     def _read_stored(self, off, n):
         out = []
         pos = 0
-        for _path, sha, sz in self.parts:
+        for k, (_path, sha, sz) in enumerate(self.parts):
             if off < pos + sz and n > 0:
                 f = self._open.get(sha)
                 if f is None:
+                    self.store.prefetch([p[1] for p in self.parts[k + 1:k + 3]])
                     f = self._open[sha] = open(self.store.cache.ensure(sha), "rb")
                 f.seek(off - pos)
                 chunk = f.read(min(n, pos + sz - off))
+                if not chunk:
+                    raise VfsError("A stored piece is shorter than expected; clear the cache in Settings and retry", 502)
                 out.append(chunk)
                 off += len(chunk)
                 n -= len(chunk)
@@ -136,57 +143,155 @@ class Reader:
         self._open.clear()
 
 
-def stage(work, src, enc, master, chunk_bytes):
-    """Encrypt (optionally) and cut `src` (file object) into pieces; hash each into the git object store.
+class Stager:
+    """Encrypt (optionally) and cut a byte stream into pieces, hashing each into the git object store.
 
-    Returns [(sha, size)]. Streams: memory use is one chunk, disk use is one chunk plus the objects.
+    Incremental: call ``write`` as data arrives, ``finish`` at the end. Memory use is one segment, disk
+    use is one piece plus the objects. ``on_piece(sha, size)`` fires whenever a piece is complete.
     """
-    parts = []
-    state = {"f": None, "n": 0, "path": None}
 
-    def close():
-        f = state["f"]
-        if f:
-            f.close()
-            sha = work.hash_file(state["path"])
-            parts.append((sha, state["n"]))
-            os.remove(state["path"])
-            state.update(f=None, n=0)
+    def __init__(self, work, enc, master, chunk_bytes, tag, on_piece=None):
+        self.work, self.chunk, self.tag, self.on_piece = work, chunk_bytes, tag, on_piece
+        self.parts = []
+        self._f = None
+        self._n = 0
+        self._path = None
+        self._buf = bytearray()
+        self._enc = crypto.Encryptor(master) if enc else None
+        if self._enc:
+            self._roll(self._enc.header)
 
-    class Roll:
-        def write(self, b):
-            mv = memoryview(b)
-            while len(mv):
-                if state["f"] is None:
-                    state["path"] = os.path.join(work.objdir, f"piece{len(parts)}")
-                    state["f"] = open(state["path"], "wb")
-                take = min(chunk_bytes - state["n"], len(mv))
-                state["f"].write(mv[:take])
-                state["n"] += take
-                mv = mv[take:]
-                if state["n"] >= chunk_bytes:
-                    close()
+    def _roll(self, data):
+        mv = memoryview(data)
+        while len(mv):
+            if self._f is None:
+                self._path = os.path.join(self.work.objdir, f"piece-{self.tag}-{len(self.parts)}")
+                self._f = open(self._path, "wb")
+            take = min(self.chunk - self._n, len(mv))
+            self._f.write(mv[:take])
+            self._n += take
+            mv = mv[take:]
+            if self._n >= self.chunk:
+                self._close()
 
-    roll = Roll()
-    if enc:
-        crypto.encrypt_stream(master, src, roll)
-    else:
-        while True:
-            b = src.read(1 << 20)
-            if not b:
-                break
-            roll.write(b)
-    close()
-    if not parts:
-        parts.append((work.hash_bytes(b""), 0))
-    return parts
+    def _close(self):
+        if self._f is None:
+            return
+        self._f.close()
+        self._f = None
+        sha = self.work.hash_file(self._path)
+        os.remove(self._path)
+        n, self._n = self._n, 0
+        self.parts.append((sha, n))
+        if self.on_piece:
+            self.on_piece(sha, n)
+
+    def write(self, data):
+        if not self._enc:
+            self._roll(data)
+            return
+        self._buf += data
+        while len(self._buf) > crypto.SEG:        # keep the last segment back: it carries the "final" flag
+            seg = bytes(self._buf[:crypto.SEG])
+            del self._buf[:crypto.SEG]
+            self._roll(self._enc.seg(seg, False))
+
+    def finish(self):
+        if self._enc:
+            self._roll(self._enc.seg(bytes(self._buf), True))
+            self._buf = bytearray()
+        self._close()
+        if not self.parts:
+            self.parts.append((self.work.hash_bytes(b""), 0))
+        return self.parts
+
+    def abandon(self):
+        if self._f:
+            self._f.close()
+            self._f = None
+
+
+def stage(work, src, enc, master, chunk_bytes):
+    """Stage a whole file object. Returns [(sha, size)]."""
+    st = Stager(work, enc, master, chunk_bytes, "s")
+    while True:
+        b = src.read(1 << 20)
+        if not b:
+            break
+        st.write(b)
+    return st.finish()
+
+
+class Ingest:
+    """One upload batch: pieces are hashed as the bytes arrive and pushed to GitHub in rolling batches
+    (hidden commits under .ark/staging), so the server never holds more than ~``stage_mb`` of a file.
+    The final commit makes the files appear and removes the staging entries in one step."""
+
+    def __init__(self, store, bid):
+        self.store, self.bid = store, bid
+        self.enc = store.encrypt_enabled()
+        self.master = store.master_for_write() if self.enc else None
+        self.chunk = config.get("chunk_mb") * 1024 * 1024
+        self.limit = config.get("stage_mb") * 1024 * 1024
+        self._cm = store.git.work()
+        self.w = self._cm.__enter__()
+        self._lock = threading.Lock()
+        self._flush = threading.Lock()
+        self.pending, self.pend_bytes, self.staged = [], 0, set()
+        self.last_error = ""
+        self.t = time.time()
+
+    def stager(self, tag):
+        return Stager(self.w, self.enc, self.master, self.chunk, tag, self._piece)
+
+    def _piece(self, sha, n):
+        with self._lock:
+            self.pending.append(sha)
+            self.pend_bytes += n
+
+    def maybe_flush(self):
+        """Call outside any lock after feeding data. Pushes a batch once enough has piled up; if the
+        client outruns GitHub (2x the batch size waiting) the caller blocks, which throttles the upload."""
+        if self.pend_bytes >= self.limit:
+            self.flush(block=self.pend_bytes >= 2 * self.limit)
+
+    def flush(self, block=False):
+        if not self._flush.acquire(blocking=block):      # another thread is already pushing
+            return
+        try:
+            with self._lock:
+                batch, self.pending, self.pend_bytes = self.pending, [], 0
+            shas = [x for x in dict.fromkeys(batch) if x not in self.staged]
+            if not shas:
+                return
+            try:
+                self.store._stage_push(self, shas)
+            except Exception as e:                      # not fatal: the final commit pushes what is left locally
+                self.last_error = str(e)
+                logging.getLogger("ark").warning("staging push failed (will retry later): %s", e)
+                with self._lock:
+                    self.pending = shas + self.pending
+        finally:
+            self._flush.release()
+
+    def abort(self):
+        try:
+            self.store.drop_staging(self)
+        except Exception:
+            pass
+
+    def close(self):
+        if self._cm:
+            cm, self._cm = self._cm, None
+            cm.__exit__(None, None, None)
 
 
 class Tx:
     """A batch of changes that becomes ONE commit. Use via ``with store.tx() as tx``."""
 
-    def __init__(self, store):
+    def __init__(self, store, ingest=None):
         self.store = store
+        self.ingest = ingest
         self.intents = []
         self.message = ""
         self.results = []
@@ -194,12 +299,24 @@ class Tx:
         self.w = None
 
     def __enter__(self):
+        if self.ingest:
+            self.w = self.ingest.w
+            return self
         self._cm = self.store.git.work()
         self.w = self._cm.__enter__()
         return self
 
     def __exit__(self, *exc):
+        if self.ingest:
+            return False
         return self._cm.__exit__(*exc)
+
+    def put_staged(self, vpath, parts, enc, mtime=None, policy="replace"):
+        """Register a file whose pieces an Ingest already hashed (and maybe pushed)."""
+        vpath = vfs.norm(vpath)
+        vfs.validate_name(vfs.basename(vpath))
+        self.intents.append(dict(op="put", path=vpath, parts=parts, enc=enc, policy=policy,
+                                 mtime=int(mtime if mtime is not None else time.time())))
 
     # -- staging ---------------------------------------------------------------------------------
     def put(self, vpath, src, mtime=None, policy="replace", enc=None):
@@ -255,6 +372,17 @@ class Store:
         self._master = None
         self.private = None
         self.last_error = ""
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ark-prefetch")
+
+    def prefetch(self, shas):
+        """Warm the disk cache with the next pieces of a file being read (hides GitHub latency)."""
+        for sha in shas:
+            if not self.cache.path(sha).exists():
+                self._pool.submit(self._warm, sha)
+
+    def _warm(self, sha):
+        with contextlib.suppress(Exception):
+            self.cache.ensure(sha)
 
     # -- configuration -------------------------------------------------------------------------
     def problems(self):
@@ -395,8 +523,62 @@ class Store:
                 "trash_items": len(idx.trash_meta), "head": idx.key}
 
     # -- writing -------------------------------------------------------------------------------
-    def tx(self):
-        return Tx(self)
+    def tx(self, ingest=None):
+        return Tx(self, ingest)
+
+    def _stage_push(self, ing, shas):
+        """Push already-hashed pieces now (hidden commit) and free them locally."""
+        branch = config.get("branch")
+        ops = [(f"{STAGE}{ing.bid}/{x}", "100644", x) for x in shas]
+        with self._wlock:
+            for _ in range(4):
+                self.refresh()
+                parent = self.git.fetch(branch)
+                try:
+                    ing.w.commit(parent, ops, f"Ark: staging upload {ing.bid}", branch)
+                    break
+                except NonFastForward:
+                    time.sleep(1)
+            else:
+                raise VfsError("Could not stage upload data (the branch kept moving)", 409)
+        ing.staged.update(shas)
+        ing.w.drop(shas)
+
+    def drop_staging(self, ing):
+        if not ing.staged:
+            return
+        branch = config.get("branch")
+        ops = [(f"{STAGE}{ing.bid}/{x}", None, None) for x in sorted(ing.staged)]
+        with self._wlock:
+            for _ in range(3):
+                parent = self.git.fetch(branch)
+                if not parent:
+                    break
+                try:
+                    ing.w.commit(parent, ops, "Ark: discard unfinished upload", branch)
+                    break
+                except NonFastForward:
+                    time.sleep(1)
+        ing.staged.clear()
+
+    def sweep_staging(self, live):
+        """Remove staging data of uploads that no longer exist (server restarted, tab closed...)."""
+        idx = self.refresh(force=True)
+        stale = [p for p, e in idx.entries.items() if p.startswith(STAGE) and e["type"] == "blob"
+                 and p[len(STAGE):].split("/")[0] not in live]
+        if not stale:
+            return 0
+        branch = config.get("branch")
+        with self._wlock, self.git.work() as w:
+            for _ in range(3):
+                parent = self.git.fetch(branch)
+                try:
+                    w.commit(parent, [(p, None, None) for p in stale], "Ark: remove abandoned upload data", branch)
+                    break
+                except NonFastForward:
+                    time.sleep(1)
+        self.refresh(force=True)
+        return len(stale)
 
     def commit(self, tx, message):
         with self._wlock:
@@ -408,6 +590,8 @@ class Store:
         for _attempt in range(4):
             idx = self.refresh(force=True)
             ops, results = self._apply(tx, idx)
+            if tx.ingest and tx.ingest.staged:       # the files now exist for real: drop their staging entries
+                ops = ops + [(f"{STAGE}{tx.ingest.bid}/{x}", None, None) for x in sorted(tx.ingest.staged)]
             if not ops:
                 return results
             try:

@@ -39,8 +39,11 @@ class FakeClient(Client):
         return key, entries, True
 
     def download_blob(self, sha, dest, progress=None):
-        with open(dest, "wb") as f:
+        tmp = f"{dest}.part"
+        with open(tmp, "wb") as f:
             f.write(self._git("cat-file", "blob", sha).stdout)
+        import os
+        os.replace(tmp, dest)
 
     def delete_branch(self, branch):
         self._git("update-ref", "-d", f"refs/heads/{branch}")
@@ -70,6 +73,9 @@ def sandbox(**settings):
     auth._fails.clear()
     remote = str(tmp / "remote.git")
     sh("git", "init", "--bare", "-q", remote)
+    # behave like GitHub: serve partial-clone fetches and lazy blob fetches
+    sh("git", "--git-dir", remote, "config", "uploadpack.allowFilter", "true")
+    sh("git", "--git-dir", remote, "config", "uploadpack.allowAnySHA1InWant", "true")
     base = {"repo_url": "test/repo", "token": "t", "refresh_seconds": 0, "chunk_mb": 1}
     base.update(settings)
     config.update(base)

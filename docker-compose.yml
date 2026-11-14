@@ -1,8 +1,11 @@
 services:
   ark:
-    build: .
+    image: ghcr.io/salehin-07/ark-storage:latest
+    # build: .          # or build from source instead of pulling the published image
     ports: ["8000:8000"]
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false     # no .env needed: the first sign-in opens a setup screen for repo + token
     volumes: ["ark-data:/data"]
     restart: unless-stopped
 volumes:

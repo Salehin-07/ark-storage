@@ -22,6 +22,19 @@ EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 NULL_SHA = "0" * 40
 
 
+# Keep git's memory flat however big the upload is: no delta search, big blobs are streamed instead of
+# loaded, and (important) a small HTTP post buffer so a push is streamed in chunks instead of being
+# buffered whole in RAM. Level-1 compression is cheap and still shrinks text.
+# pack.useSparse=false matters: the sparse walk would not recognise blobs that merely moved path (staging ->
+# final) as already on the server, so git would lazily re-download what we just freed and push it again.
+# (core.bigFileThreshold is set only for network commands: for `hash-object` it would write packs
+# instead of loose objects, which cannot be freed one by one.)
+LEAN = ["-c", "gc.auto=0", "-c", "http.postBuffer=1048576", "-c", "pack.window=0", "-c", "pack.threads=1", "-c", "pack.useSparse=false",
+        "-c", "pack.compression=1", "-c", "core.looseCompression=1",
+        "-c", "pack.deltaCacheSize=1m", "-c", "pack.windowMemory=8m", "-c", "core.packedGitLimit=64m",
+        "-c", "core.packedGitWindowSize=16m", "-c", "core.fsync=none"]
+
+
 class GitHubError(Exception):
     def __init__(self, message, status=None):
         super().__init__(message)
@@ -183,15 +196,14 @@ class Git:
     def _auth(self):
         tok = config.get("token")
         b = base64.b64encode(f"x-access-token:{tok}".encode()).decode()
-        return ["-c", f"http.extraheader=Authorization: Basic {b}", "-c", "http.postBuffer=524288000",
-                "-c", "protocol.version=2", "-c", "gc.auto=0"]
+        return ["-c", f"http.extraheader=Authorization: Basic {b}", "-c", "protocol.version=2"]
 
     def url(self):
         o, n = config.parse_repo(config.get("repo_url"))
         return f"https://github.com/{o}/{n}.git"
 
     def run(self, args, remote=False, input=None, env=None, timeout=900, check=True):
-        cmd = ["git"] + (self._auth() if remote else ["-c", "gc.auto=0"]) + ["--git-dir", str(self.dir)] + args
+        cmd = ["git"] + LEAN + (self._auth() + ["-c", "core.bigFileThreshold=1m"] if remote else []) + ["--git-dir", str(self.dir)] + args
         try:
             p = subprocess.run(cmd, input=input, capture_output=True, env=self._env(env), timeout=timeout)
         except FileNotFoundError:
@@ -254,6 +266,12 @@ class Work:
 
     def hash_file(self, path):
         return self.run(["hash-object", "-w", "--", path]).stdout.decode().strip()
+
+    def drop(self, shas):
+        """Forget locally-held blobs that are safely on the remote (frees disk)."""
+        for sha in shas:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(self.objdir, sha[:2], sha[2:]))
 
     def hash_bytes(self, data):
         return self.run(["hash-object", "-w", "--stdin"], input=data).stdout.decode().strip()

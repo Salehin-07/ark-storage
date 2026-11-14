@@ -58,25 +58,35 @@ def encrypted_size(plain: int) -> int:
     return HEADER + plain + n * TAG
 
 
+class Encryptor:
+    """Incremental encryption: ``header`` once, then ``seg(plain, final)`` for each segment in order."""
+
+    def __init__(self, master: bytes):
+        fsalt = os.urandom(16)
+        self.header = MAGIC + bytes([VERSION, SEG_EXP]) + fsalt
+        self._aes = AESGCM(_subkey(master, fsalt))
+        self._i = 0
+
+    def seg(self, plain: bytes, final: bool) -> bytes:
+        ct = self._aes.encrypt(_nonce(self._i), plain, self.header + (b"\x01" if final else b"\x00"))
+        self._i += 1
+        return ct
+
+
 def encrypt_stream(master: bytes, src, dst) -> int:
     """Encrypt file object `src` into `dst`; returns bytes written."""
-    fsalt = os.urandom(16)
-    header = MAGIC + bytes([VERSION, SEG_EXP]) + fsalt
-    aes = AESGCM(_subkey(master, fsalt))
-    dst.write(header)
-    written = len(header)
-    i = 0
+    enc = Encryptor(master)
+    dst.write(enc.header)
+    written = len(enc.header)
     cur = src.read(SEG)
     while True:
         nxt = src.read(SEG) if len(cur) == SEG else b""
-        final = not nxt
-        ct = aes.encrypt(_nonce(i), cur, header + (b"\x01" if final else b"\x00"))
+        ct = enc.seg(cur, not nxt)
         dst.write(ct)
         written += len(ct)
-        if final:
+        if not nxt:
             return written
         cur = nxt
-        i += 1
 
 
 def decrypt_range(master: bytes, read_at, enc_size: int, start: int, end: int):

@@ -52,7 +52,7 @@
     $("#login").hidden = true; app.hidden = false;
     build();
     st.defaultPw = !!sess.default_password;
-    loadStatus();
+    loadStatus().then(() => { if (st.status && st.status.problems && st.status.problems.length) openSetup(); });
     route();
   }
 
@@ -156,7 +156,7 @@
   function renderBanner() {
     const s = st.status, msgs = [];
     if (st.defaultPw && !st.dismissed.pw) msgs.push({ k: "pw", t: "You are still using the default password (ark / ark).", a: "Change it", f: () => openSettings("acct") });
-    if (s && s.problems && s.problems.length) msgs.push({ k: "setup", bad: true, t: "Setup needed: " + s.problems[0], a: "Open settings", f: () => openSettings("repo") });
+    if (s && s.problems && s.problems.length) msgs.push({ k: "setup", bad: true, t: "Setup needed: " + s.problems[0], a: "Set up now", f: () => openSetup() });
     else if (s && s.error) msgs.push({ k: "err", bad: true, t: s.error, a: "Settings", f: () => openSettings("repo") });
     else if (s && s.private === false && !(s.crypto && s.crypto.enabled) && !st.dismissed.pub) msgs.push({ k: "pub", t: "This repository is public, so plain files stored here are readable by anyone.", a: "Encrypt", f: () => openSettings("enc") });
     if (s && s.git === false) msgs.push({ k: "git", bad: true, t: "git is not installed on the server; uploads won't work." });
@@ -424,12 +424,20 @@
     await guard(async () => { await api("/api/rename", { method: "POST", body: { path: e.path, name } }); st.sel = []; await reload(); });
   }
   async function del(es) {
-    const trash = !st.status || !st.status.stats || true;
     const what = es.length === 1 ? `“${es[0].name}”` : `${es.length} items`;
     const mode = await choose("Delete " + what + "?", "Move to the trash so you can restore it later, or delete it permanently.",
       [{ label: "Delete forever", kind: "danger", value: "perm" }, { label: "Move to trash", kind: "primary", value: "trash" }]);
     if (!mode) return;
-    await guard(async () => { await api("/api/delete", { method: "POST", body: { paths: es.map((x) => x.path), permanent: mode === "perm" } }); st.sel = []; await reload(); loadStatus(); toast(mode === "perm" ? "Deleted" : "Moved to trash"); });
+    // The list updates at once; GitHub is told in the background and the list is re-synced afterwards.
+    const gone = new Set(es.map((x) => x.path));
+    st.entries = st.entries.filter((e) => !gone.has(e.path)); st.sel = []; render();
+    const x = newXfer((mode === "perm" ? "Deleting " : "Moving to trash: ") + what); x.msg = "Saving to GitHub…"; x.progress = 0.3; renderXfer();
+    try {
+      await api("/api/delete", { method: "POST", body: { paths: es.map((y) => y.path), permanent: mode === "perm" } });
+      x.state = "done"; x.progress = 1; x.msg = ""; renderXfer();
+      toast(mode === "perm" ? "Deleted" : "Moved to trash");
+    } catch (e) { x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad"); }
+    reload(); loadStatus();
   }
   function setClip(cut) { st.clip = { paths: st.sel.slice(), cut }; paint(); el.paste.hidden = false; toast(`${st.clip.paths.length} item(s) ${cut ? "cut" : "copied"}`); }
   async function doPaste(into) {
@@ -486,20 +494,40 @@
 
   // ------------------------------------------------------------ trash
   async function showTrash() {
-    st.mode = "trash"; st.sel = [];
+    st.mode = "trash"; st.sel = []; st.tsel = new Set();
     const d = await guard(() => api("/api/trash")); st.trash = d ? d.items : [];
     renderCrumbs(); el.nav.files.classList.remove("on"); el.nav.trash.classList.add("on"); el.paste.hidden = true; el.viewSeg.hidden = true; el.selBar.hidden = true;
-    el.list.className = "";
-    const rows = st.trash.map((t) => h("div", { class: "row", style: { gridTemplateColumns: "minmax(0,1fr) 110px 150px 200px" } },
-      h("div", { class: "nm" }, h("div", { class: "ic " + (t.dir ? "dir" : "file") }, icon(t.dir ? "folder" : "file")), h("div", { style: { minWidth: 0 } }, h("div", { class: "t", style: { overflow: "hidden", textOverflow: "ellipsis" } }, t.name), h("div", { class: "muted", style: { fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis" } }, t.path))),
-      h("div", { class: "sz" }, t.dir ? "folder" : fmtBytes(t.size)), h("div", { class: "md" }, fmtDate(t.ts)),
-      h("div", { style: { display: "flex", gap: "6px" } },
-        btn("Restore", "restore", async () => { await guard(async () => { await api("/api/trash/restore", { method: "POST", body: { ids: [t.id] } }); toast("Restored to " + t.path); await showTrash(); loadStatus(); }); }),
-        btn("", "trash", async () => { if (await ask("Delete forever?", `“${t.name}” will be removed permanently.`, { ok: "Delete", danger: true })) await guard(async () => { await api("/api/trash/empty", { method: "POST", body: { ids: [t.id] } }); await showTrash(); }); }, "danger icon", "Delete forever"))));
-    el.list.replaceChildren(...(rows.length ? [h("div", { style: { padding: "10px 14px", display: "flex", gap: "8px", alignItems: "center" } }, h("span", { class: "muted" }, `${rows.length} item(s). Items stay in git history until you compact it.`), h("span", { class: "spacer" }),
-      btn("Restore all", "restore", async () => { await guard(async () => { await api("/api/trash/restore", { method: "POST", body: { ids: st.trash.map((t) => t.id) } }); toast("Restored"); await showTrash(); loadStatus(); }); }),
-      btn("Empty trash", "trash", async () => { if (await ask("Empty the trash?", "Everything in it is removed permanently.", { ok: "Empty trash", danger: true })) await guard(async () => { await api("/api/trash/empty", { method: "POST", body: {} }); toast("Trash emptied"); await showTrash(); loadStatus(); }); }, "danger")), ...rows] : [h("div", { class: "empty" }, icon("trash"), h("div", null, "The trash is empty."))]));
-    paint(); el.selBar.hidden = true;
+    drawTrash();
+  }
+  // Runs a trash action: rows vanish immediately, GitHub is updated in the background, list re-synced after.
+  async function trashAct(ids, url, label, okMsg) {
+    const gone = new Set(ids);
+    st.trash = st.trash.filter((t) => !gone.has(t.id)); st.tsel = new Set(); drawTrash();
+    const x = newXfer(label); x.msg = "Saving to GitHub…"; x.progress = 0.3; renderXfer();
+    try { await api(url, { method: "POST", body: { ids } }); x.state = "done"; x.progress = 1; x.msg = ""; renderXfer(); toast(okMsg); }
+    catch (e) { x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad"); }
+    await showTrash(); loadStatus();
+  }
+  function drawTrash() {
+    el.selBar.hidden = true; el.list.className = "";
+    const sel = st.tsel, all = st.trash.map((t) => t.id), picked = all.filter((i) => sel.has(i));
+    const tool = h("div", { style: { padding: "10px 14px", display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" } },
+      h("span", { class: "muted" }, picked.length ? `${picked.length} selected` : `${all.length} item(s). Items stay in git history until you compact it.`), h("span", { class: "spacer" }),
+      picked.length ? btn("Restore selected", "restore", () => trashAct(picked, "/api/trash/restore", `Restoring ${picked.length} item(s)`, "Restored")) : btn("Restore all", "restore", () => trashAct(all, "/api/trash/restore", "Restoring everything", "Restored")),
+      picked.length
+        ? btn("Delete selected", "trash", async () => { if (await ask("Delete forever?", `${picked.length} item(s) will be removed permanently.`, { ok: "Delete", danger: true })) trashAct(picked, "/api/trash/empty", `Deleting ${picked.length} item(s) forever`, "Deleted"); }, "danger")
+        : btn("Empty trash", "trash", async () => { if (await ask("Empty the trash?", "Everything in it is removed permanently.", { ok: "Empty trash", danger: true })) trashAct(all, "/api/trash/empty", "Emptying the trash", "Trash emptied"); }, "danger"));
+    const rows = st.trash.map((t) => {
+      const chk = h("input", { type: "checkbox", class: "chk always", checked: sel.has(t.id), "aria-label": "Select " + t.name, onclick: (e) => { e.stopPropagation(); if (chk.checked) sel.add(t.id); else sel.delete(t.id); drawTrash(); } });
+      return h("div", { class: "row" + (sel.has(t.id) ? " sel" : ""), style: { gridTemplateColumns: "28px minmax(0,1fr) 110px 150px 200px" } }, chk,
+        h("div", { class: "nm" }, h("div", { class: "ic " + (t.dir ? "dir" : "file") }, icon(t.dir ? "folder" : "file")), h("div", { style: { minWidth: 0 } }, h("div", { class: "t", style: { overflow: "hidden", textOverflow: "ellipsis" } }, t.name), h("div", { class: "muted", style: { fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis" } }, t.path))),
+        h("div", { class: "sz" }, t.dir ? "folder" : fmtBytes(t.size)), h("div", { class: "md" }, fmtDate(t.ts)),
+        h("div", { style: { display: "flex", gap: "6px" } },
+          btn("Restore", "restore", () => trashAct([t.id], "/api/trash/restore", "Restoring " + t.name, "Restored to " + t.path)),
+          btn("", "trash", async () => { if (await ask("Delete forever?", `“${t.name}” will be removed permanently.`, { ok: "Delete", danger: true })) trashAct([t.id], "/api/trash/empty", "Deleting " + t.name, "Deleted"); }, "danger icon", "Delete forever")));
+    });
+    el.list.replaceChildren(...(rows.length ? [tool, ...rows] : [h("div", { class: "empty" }, icon("trash"), h("div", null, "The trash is empty."))]));
+    renderCrumbs();
   }
 
   // ------------------------------------------------------------ uploads
@@ -530,36 +558,44 @@
       if (!policy) return;
     }
     const batches = []; let cur = [], bytes = 0;
-    files.forEach((f) => { if (cur.length && (bytes + f.file.size > 256 * 1048576 || cur.length >= 300)) { batches.push(cur); cur = []; bytes = 0; } cur.push(f); bytes += f.file.size; });
+    files.forEach((f) => { if (cur.length && (bytes + f.file.size > 1024 * 1048576 || cur.length >= 300)) { batches.push(cur); cur = []; bytes = 0; } cur.push(f); bytes += f.file.size; });
     if (cur.length || (dirs && dirs.length)) batches.push(cur);
     for (let b = 0; b < batches.length; b++) {
       const batch = batches[b], total = batch.reduce((s, f) => s + f.file.size, 0) || 1;
       const x = newXfer(batch.length === 1 ? batch[0].file.name : `${batch.length} files` + (batches.length > 1 ? ` (batch ${b + 1}/${batches.length})` : ""));
+      let begin = null;
       try {
-        const begin = await api("/api/upload/begin", { method: "POST", body: { files: batch.map((f) => ({ id: f.id, size: f.file.size })) } });
-        let sent = 0, next = 0;
+        begin = await api("/api/upload/begin", { method: "POST", body: { files: batch.map((f) => ({ id: f.id, size: f.file.size })) } });
+        const CH = begin.chunk || CHUNK;
+        // Every chunk of every file goes into one queue; 4 requests are always in flight, so even a single
+        // huge file saturates the connection. The server puts the pieces back in order.
+        const tasks = [];
+        batch.forEach((f) => { for (let off = 0; off < f.file.size || (off === 0 && f.file.size === 0); off += CH) { tasks.push({ f, off }); if (f.file.size === 0) break; } });
+        let sent = 0, next = 0, t0 = performance.now();
         const worker = async () => {
-          while (next < batch.length) {
-            const f = batch[next++];
-            for (let off = 0; off < f.file.size || (off === 0 && f.file.size === 0); off += CHUNK) {
-              const blob = f.file.slice(off, off + CHUNK);
-              for (let tries = 0; ; tries++) {
-                try {
-                  const r = await fetch(`/api/upload/${begin.batch}/${f.id}?offset=${off}`, { method: "PUT", headers: { "X-CSRF-Token": S.csrf }, body: blob, credentials: "same-origin" });
-                  if (!r.ok) { let m = r.statusText; try { m = (await r.json()).error || m; } catch (e) { /* */ } throw new Error(m); }
-                  break;
-                } catch (e) { if (tries >= 2) throw e; await new Promise((r) => setTimeout(r, 800 * (tries + 1))); }
-              }
-              sent += blob.size; x.progress = (sent / total) * 0.5; x.msg = `Uploading ${fmtBytes(sent)} of ${fmtBytes(total)}`; renderXfer();
-              if (f.file.size === 0) break;
+          while (next < tasks.length) {
+            const { f, off } = tasks[next++];
+            const blob = f.file.slice(off, off + CH);
+            for (let tries = 0; ; tries++) {
+              try {
+                const r = await fetch(`/api/upload/${begin.batch}/${f.id}?offset=${off}`, { method: "PUT", headers: { "X-CSRF-Token": S.csrf }, body: blob, credentials: "same-origin" });
+                if (!r.ok) { let m = r.statusText; try { m = (await r.json()).error || m; } catch (e) { /* */ } const er = new Error(m); er.fatal = r.status < 500 && r.status !== 429; throw er; }
+                break;
+              } catch (e) { if (e.fatal || tries >= 4) throw e; await new Promise((r) => setTimeout(r, 600 * (tries + 1))); }
             }
+            sent += blob.size;
+            const sp = sent / Math.max(0.5, (performance.now() - t0) / 1000);
+            x.progress = (sent / total) * 0.9; x.msg = `Uploading ${fmtBytes(sent)} of ${fmtBytes(total)} · ${fmtBytes(sp)}/s`; renderXfer();
           }
         };
-        await Promise.all([worker(), worker(), worker()]);
-        x.msg = "Sending to GitHub…"; renderXfer();
+        await Promise.all([worker(), worker(), worker(), worker()]);
+        x.msg = "Finishing on GitHub…"; x.progress = 0.92; renderXfer();
         const r = await api(`/api/upload/${begin.batch}/commit`, { method: "POST", body: { files: batch.map((f) => ({ id: f.id, path: f.path, mtime: f.mtime })), dirs: b === 0 ? dirs || [] : [], on_conflict: policy } });
-        await followJob(r.job, x, 0.5);
-      } catch (e) { x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad"); }
+        await followJob(r.job, x, 0.92);
+      } catch (e) {
+        x.state = "err"; x.msg = e.message; renderXfer(); toast(e.message, "bad");
+        if (begin && begin.batch) api(`/api/upload/${begin.batch}/cancel`, { method: "POST", body: {} }).catch(() => {});
+      }
     }
     reload(); loadStatus();
   }
@@ -614,6 +650,13 @@
   }
 
   // ------------------------------------------------------------ settings / session
+  function openSetup() {
+    window.Settings.setup({
+      defaultPw: st.defaultPw,
+      account: (u) => { st.user = u; st.defaultPw = false; renderBanner(); },
+      done: () => { loadStatus(); reload(); },
+    });
+  }
   function openSettings(tab) {
     window.Settings.open(tab, {
       reload: () => { loadStatus(); reload(); }, jobs: () => { st.xferOpen = true; pollJobs(); },

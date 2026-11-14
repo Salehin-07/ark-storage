@@ -23,6 +23,7 @@ SCHEMA = {
     "encrypt":        ("bool", False, ("ARK_ENCRYPT",), False, False),
     "passphrase":     ("str", "", ("ARK_PASSPHRASE",), True, False),
     "chunk_mb":       ("int", 48, ("ARK_CHUNK_MB",), False, False),
+    "stage_mb":       ("int", 64, ("ARK_STAGE_MB",), False, False),
     "cache_mb":       ("int", 1024, ("ARK_CACHE_MB",), False, False),
     "max_upload_mb":  ("int", 20480, ("ARK_MAX_UPLOAD_MB",), False, False),
     "trash":          ("bool", True, ("ARK_TRASH",), False, False),
@@ -34,7 +35,7 @@ SCHEMA = {
     "commit_email":   ("str", "ark-storage@users.noreply.github.com", ("ARK_COMMIT_EMAIL",), False, False),
     "theme":          ("str", "auto", ("ARK_THEME",), False, False),
 }
-LIMITS = {"chunk_mb": (1, 95), "cache_mb": (64, 1048576), "max_upload_mb": (0, 10485760),
+LIMITS = {"chunk_mb": (1, 95), "stage_mb": (1, 1536), "cache_mb": (64, 1048576), "max_upload_mb": (0, 10485760),
           "refresh_seconds": (0, 3600), "share_hours": (1, 24 * 365), "session_hours": (1, 24 * 365)}
 CHOICES = {"theme": ("auto", "light", "dark")}
 

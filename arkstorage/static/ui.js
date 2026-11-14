@@ -3,6 +3,12 @@
   "use strict";
   const NS = "http://www.w3.org/2000/svg";
 
+  // Browsers print null/undefined/false passed to these as the text "null"; drop them instead.
+  for (const m of ["replaceChildren", "append", "prepend"]) {
+    const orig = Element.prototype[m];
+    Element.prototype[m] = function (...k) { return orig.apply(this, k.flat().filter((x) => x !== null && x !== undefined && x !== false)); };
+  }
+
   function h(tag, attrs, ...kids) {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {

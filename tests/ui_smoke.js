@@ -28,7 +28,7 @@ w.fetch = (url, init = {}) => {
     case "/api/list": return json({ path: u.searchParams.get("path"), crumbs: [{ name: "Home", path: "/" }], entries: files, head: "abc1234" });
     case "/api/status": return json({ version: "1.0.0", problems: [], branch: "ark-data", private: false, repo: "me/r", repo_kb: 100, git: true, crypto: { enabled: false, passphrase_set: false, initialised: false }, stats: { files: 5, folders: 1, bytes: 123456, trash_items: 1 }, cache_bytes: 0 });
     case "/api/text": return json({ path: "/a.txt", content: "hello\nworld", size: 11, sha: "s1" });
-    case "/api/settings": return json({ settings: { repo_url: { kind: "str", value: "me/r", source: "env", secret: false }, token: { kind: "str", value: "", set: true, source: "env", secret: true }, branch: { kind: "str", value: "ark-data", source: "default" }, encrypt: { kind: "bool", value: false, source: "default" }, passphrase: { kind: "str", value: "", set: false, secret: true, source: "default" }, chunk_mb: { kind: "int", value: 48, min: 1, max: 95, source: "default" }, cache_mb: { kind: "int", value: 1024, min: 64, max: 99, source: "default" }, max_upload_mb: { kind: "int", value: 20480, min: 0, max: 99, source: "default" }, refresh_seconds: { kind: "int", value: 10, min: 0, max: 99, source: "default" }, trash: { kind: "bool", value: true, source: "default" }, show_hidden: { kind: "bool", value: false, source: "default" }, share_hours: { kind: "int", value: 24, min: 1, max: 99, source: "default" }, theme: { kind: "str", value: "auto", choices: ["auto", "light", "dark"], source: "default" }, session_hours: { kind: "int", value: 168, min: 1, max: 99, source: "default" }, commit_name: { kind: "str", value: "Ark", source: "default" }, commit_email: { kind: "str", value: "a@b.c", source: "default" } }, problems: [] });
+    case "/api/settings": return json({ settings: { repo_url: { kind: "str", value: "me/r", source: "env", secret: false }, token: { kind: "str", value: "", set: true, source: "env", secret: true }, branch: { kind: "str", value: "ark-data", source: "default" }, encrypt: { kind: "bool", value: false, source: "default" }, passphrase: { kind: "str", value: "", set: false, secret: true, source: "default" }, chunk_mb: { kind: "int", value: 48, min: 1, max: 95, source: "default" }, stage_mb: { kind: "int", value: 48, min: 1, max: 95, source: "default" }, cache_mb: { kind: "int", value: 1024, min: 64, max: 99, source: "default" }, max_upload_mb: { kind: "int", value: 20480, min: 0, max: 99, source: "default" }, refresh_seconds: { kind: "int", value: 10, min: 0, max: 99, source: "default" }, trash: { kind: "bool", value: true, source: "default" }, show_hidden: { kind: "bool", value: false, source: "default" }, share_hours: { kind: "int", value: 24, min: 1, max: 99, source: "default" }, theme: { kind: "str", value: "auto", choices: ["auto", "light", "dark"], source: "default" }, session_hours: { kind: "int", value: 168, min: 1, max: 99, source: "default" }, commit_name: { kind: "str", value: "Ark", source: "default" }, commit_email: { kind: "str", value: "a@b.c", source: "default" } }, problems: [] });
     case "/api/trash": return json({ items: [{ id: "1", name: "old.txt", path: "/old.txt", dir: false, ts: 1700000000, size: 3 }] });
     default: return json({ ok: true });
   }
@@ -55,6 +55,7 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   ok(rows[1].classList.contains("sel") && !q("#sel-bar").hidden, "click selects, action bar appears");
   rows[2].dispatchEvent(new w.MouseEvent("click", { bubbles: true, ctrlKey: true })); await tick();
   ok(qa(".row.sel").length === 2, "ctrl+click adds to selection");
+  ok(!/null|undefined/.test(q("#sel-bar").textContent), "selection bar never prints null");
   rows[1].dispatchEvent(new w.MouseEvent("contextmenu", { bubbles: true })); await tick();
   ok(!!q(".menu") && /Delete/.test(q(".menu").textContent), "context menu");
   w.document.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape" })); q(".menu") && q(".menu").remove();
@@ -79,6 +80,11 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   q(".scrim").remove();
   q("#side .nav:nth-child(2)").click(); await tick(150);
   ok(/old.txt/.test(q("#list").textContent), "trash view lists items");
+  ok(!/null|undefined/.test(q("#list").textContent), "trash view never prints null");
+  w.Settings.setup({ defaultPw: true }); await tick(150);
+  ok(!!q(".dlg") && /Welcome to Ark Storage/.test(q(".dlg").textContent) && !!q(".dlg input[type=password]"), "setup wizard opens with repository + token fields");
+  q(".scrim").remove();
+  ok(qa("#list .row .chk").length >= 1, "trash rows can be selected");
   ok(errors.length === 0, "no script errors" + (errors.length ? ": " + errors.join("; ") : ""));
   console.log(fails ? fails + " FAILED" : "UI smoke OK");
   process.exit(fails ? 1 : 0);

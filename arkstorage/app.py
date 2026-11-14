@@ -1,5 +1,6 @@
 """Flask application: JSON API + the single-page file browser."""
 import base64
+import contextlib
 import functools
 import mimetypes
 import os
@@ -19,7 +20,7 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from . import __version__, auth, config, crypto, vfs, zipstream
 from .gh import GitHubError
 from .jobs import Jobs
-from .store import Store
+from .store import Ingest, Store
 from .vfs import VfsError
 
 STATIC = Path(__file__).parent / "static"
@@ -444,10 +445,26 @@ def create_app():
         return jsonify(ok=True)
 
     # ---------------------------------------------------------------- uploads
+    # Chunks may arrive in parallel and out of order. They are ingested strictly in order; every finished
+    # piece is hashed straight into git and pushed in rolling batches, so disk use stays flat.
+    UP_CHUNK = 16 * 1048576          # what the web client sends per request (4 in flight)
+
     def batch_dir(bid):
         if not re.fullmatch(r"[0-9a-f]{16}", bid or ""):
             raise VfsError("Bad upload id", 400)
         return config.DATA_DIR / "uploads" / bid
+
+    def end_batch(bid, u):
+        u["ing"].abort()
+        u["ing"].close()
+        shutil.rmtree(batch_dir(bid), ignore_errors=True)
+
+    def get_batch(bid):
+        with up_lock:
+            u = uploads.get(bid)
+        if u is None:
+            raise VfsError("Unknown upload", 404)
+        return u
 
     @app.post("/api/upload/begin")
     @api
@@ -463,82 +480,132 @@ def create_app():
             total += sz
         root = config.DATA_DIR / "uploads"
         root.mkdir(parents=True, exist_ok=True)
-        for old in root.iterdir():           # clean abandoned batches
-            if time.time() - old.stat().st_mtime > 6 * 3600:
-                shutil.rmtree(old, ignore_errors=True)
-        free = shutil.disk_usage(root).free
-        if total * 2.2 > free:
-            raise VfsError(f"Not enough free disk space on the server for this upload ({total // 1048576} MB needs about "
-                           f"{int(total * 2.2) // 1048576} MB free).", 507)
-        bid = secrets.token_hex(8)
-        (root / bid).mkdir()
+        now = time.time()
         with up_lock:
-            uploads[bid] = {str(f["id"]): {"size": int(f.get("size", 0)), "got": 0} for f in files}
-        return jsonify(batch=bid)
+            stale = [(k, uploads.pop(k)) for k in [k for k, u in uploads.items() if now - u["t"] > 6 * 3600]]
+            live = set(uploads)
+        for k, u in stale:
+            end_batch(k, u)
+        for old in root.iterdir():                       # abandoned directories (e.g. after a restart)
+            if old.name not in live and now - old.stat().st_mtime > 3600:
+                shutil.rmtree(old, ignore_errors=True)
+        for old in config.DATA_DIR.glob("ark-obj-*"):
+            if now - old.stat().st_mtime > 6 * 3600:
+                shutil.rmtree(old, ignore_errors=True)
+        if not live:
+            with contextlib.suppress(Exception):
+                store.sweep_staging(live)
+        chunk = config.get("chunk_mb") * 1048576
+        need = min(total, config.get("stage_mb") * 1048576 + 3 * chunk) + 4 * UP_CHUNK + 64 * 1048576
+        free = shutil.disk_usage(root).free
+        if need > free:
+            raise VfsError(f"Not enough free disk space on the server for this upload: it needs about "
+                           f"{need // 1048576} MB free (it streams to GitHub, so this does not grow with the file). "
+                           f"Lower 'Push batch' in Settings -> Performance to need less.", 507)
+        bid = secrets.token_hex(8)
+        ing = Ingest(store, bid)
+        (root / bid).mkdir()
+        fs = {str(f["id"]): {"size": int(f.get("size", 0)), "got": 0, "st": None, "pend": {}, "parts": None,
+                             "err": "", "lock": threading.Lock()} for f in files}
+        with up_lock:
+            uploads[bid] = {"ing": ing, "files": fs, "t": now}
+        return jsonify(batch=bid, chunk=UP_CHUNK)
 
     @app.put("/api/upload/<bid>/<fid>")
     @api
     def upload_chunk(bid, fid):
+        u = get_batch(bid)
+        F = u["files"].get(fid)
         d = batch_dir(bid)
-        with up_lock:
-            meta = uploads.get(bid, {}).get(fid)
-        if meta is None or not d.exists():
+        if F is None or not d.exists():
             raise VfsError("Unknown upload", 404)
         offset = int(request.args.get("offset", 0))
-        path = d / re.sub(r"\W", "_", fid)
-        mode = "r+b" if path.exists() else "wb"
-        with open(path, mode) as f:
-            f.seek(offset)
-            n = 0
-            while True:
-                chunk = request.stream.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                n += len(chunk)
-        if offset + n > meta["size"]:
+        safe = re.sub(r"\W", "_", fid)
+        tmp = d / f"{safe}.{offset}"
+        n = 0
+        try:
+            with open(tmp, "wb") as f:
+                while True:
+                    blk = request.stream.read(1 << 20)
+                    if not blk:
+                        break
+                    f.write(blk)
+                    n += len(blk)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            raise
+        if offset + n > F["size"]:
+            os.remove(tmp)
             raise VfsError("Received more data than announced", 400)
-        meta["got"] = max(meta["got"], offset + n)
-        return jsonify(ok=True, got=meta["got"])
+        with F["lock"]:
+            if F["err"]:
+                os.remove(tmp)
+                raise VfsError(F["err"], 500)
+            if F["parts"] is not None or offset < F["got"]:          # a retry of data we already hold
+                with contextlib.suppress(OSError):
+                    os.remove(tmp)
+                return jsonify(ok=True, got=F["got"])
+            F["pend"][offset] = (tmp, n)
+            try:
+                if F["st"] is None:
+                    F["st"] = u["ing"].stager(safe)
+                while F["got"] in F["pend"]:
+                    path, k = F["pend"].pop(F["got"])
+                    with open(path, "rb") as src:
+                        while True:
+                            blk = src.read(1 << 20)
+                            if not blk:
+                                break
+                            F["st"].write(blk)
+                    os.remove(path)
+                    F["got"] += k
+                if F["got"] == F["size"]:
+                    F["parts"] = F["st"].finish()
+            except Exception as e:
+                F["err"] = f"Could not process the upload: {e}"
+                raise VfsError(F["err"], 500) from None
+            got = F["got"]
+        u["ing"].maybe_flush()
+        return jsonify(ok=True, got=got)
 
     @app.post("/api/upload/<bid>/commit")
     @api
     def upload_commit(bid):
-        d = batch_dir(bid)
+        u = get_batch(bid)
+        ing = u["ing"]
         data = body()
         files = data.get("files", [])
         policy = data.get("on_conflict", "rename")
-        with up_lock:
-            meta = uploads.get(bid)
-        if meta is None:
-            raise VfsError("Unknown upload", 404)
         plan = []
         for f in files:
-            fid = str(f["id"])
-            m = meta.get(fid)
-            if m is None or m["got"] != m["size"]:
+            F = u["files"].get(str(f["id"]))
+            if F is None or F["parts"] is None:
                 raise VfsError(f"'{f.get('path')}' was not fully received", 400)
             path = vfs.norm(f["path"])
             vfs.validate_name(vfs.basename(path))
-            plan.append((path, d / re.sub(r"\W", "_", fid), f.get("mtime")))
-            if not plan[-1][1].exists():
-                plan[-1][1].touch()
+            plan.append((path, F["parts"], f.get("mtime")))
         empty_dirs = [vfs.norm(p) for p in data.get("dirs", [])]
         title = f"Upload {len(plan)} file(s)" if len(plan) != 1 else f"Upload {vfs.basename(plan[0][0])}"
 
         def run(job):
+            ok = False
             try:
-                with store.tx() as tx:
-                    for k, (path, tmp, mtime) in enumerate(plan):
-                        job.update(k / max(1, len(plan)) * 0.8, f"Preparing {vfs.basename(path)}")
-                        tx.put(path, tmp, mtime=(mtime / 1000 if mtime else None), policy=policy)
-                        os.remove(tmp)
+                with store.tx(ingest=ing) as tx:
+                    for path, parts, mtime in plan:
+                        tx.put_staged(path, parts, ing.enc, mtime=(mtime / 1000 if mtime else None), policy=policy)
                     for dd in empty_dirs:
                         tx.mkdir(dd)
                     job.update(0.85, "Pushing to GitHub")
-                    return store.commit(tx, title)
+                    res = store.commit(tx, title)
+                    ing.staged.clear()
+                    ok = True
+                    return res
             finally:
-                shutil.rmtree(d, ignore_errors=True)
+                if not ok:
+                    ing.abort()
+                ing.close()
+                shutil.rmtree(batch_dir(bid), ignore_errors=True)
                 with up_lock:
                     uploads.pop(bid, None)
         job = jobs.start("upload", title, run)
@@ -547,9 +614,10 @@ def create_app():
     @app.post("/api/upload/<bid>/cancel")
     @api
     def upload_cancel(bid):
-        shutil.rmtree(batch_dir(bid), ignore_errors=True)
         with up_lock:
-            uploads.pop(bid, None)
+            u = uploads.pop(bid, None)
+        if u:
+            end_batch(bid, u)
         return jsonify(ok=True)
 
     # ---------------------------------------------------------------- compress / extract

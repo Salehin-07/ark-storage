@@ -1,6 +1,6 @@
 # Deploying
 
-**Anywhere with Docker**: `docker compose up -d` (volume `ark-data` holds settings and cache).
+**Anywhere with Docker**: `docker run -d -p 8000:8000 -v ark-data:/data ghcr.io/salehin-07/ark-storage:latest` (or `docker compose up -d`) (volume `ark-data` holds settings and cache).
 **Render**: New → Blueprint → this repo (`render.yaml`). Set `ARK_REPO_URL` and `ARK_GITHUB_TOKEN`. `ARK_SECRET_KEY` is generated.
 On the free plan the disk is ephemeral: settings saved in the UI are lost on redeploy, so use environment variables for anything
 you want to keep (`ARK_ENCRYPT`, `ARK_PASSPHRASE`, `ARK_PASSWORD`, ...). The free plan also sleeps when idle.

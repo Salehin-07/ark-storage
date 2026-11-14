@@ -33,7 +33,8 @@ gunicorn -c gunicorn.conf.py wsgi:app    # or: python wsgi.py
 
 Open <http://localhost:8000>, sign in with `ark` / `ark` and change the password under **Settings → Account**.
 
-Docker: `cp .env.example .env`, edit it, then `docker compose up -d`.
+Docker: `docker run -d -p 8000:8000 -v ark-data:/data ghcr.io/salehin-07/ark-storage:latest`, open http://localhost:8000, sign in with `ark` / `ark`;
+the first sign-in opens a setup screen that asks for your repository and token (or pass `ARK_REPO_URL` / `ARK_GITHUB_TOKEN` as environment variables, or use `docker compose up -d`).
 Render: use `render.yaml` (a Docker web service), set the two variables, done. See [docs/deploy.md](docs/deploy.md).
 
 ## Configuration
@@ -86,7 +87,7 @@ Details: [docs/architecture.md](docs/architecture.md), [docs/security.md](docs/s
   **Settings → Maintenance → Compact history** squashes history to reclaim space. GitHub recommends repositories stay under ~5 GB.
 - Free hosts with ephemeral disks (Render free) lose the cache and settings on redeploy. Set `ARK_SECRET_KEY`,
   and keep your settings in environment variables; your *files* are in GitHub and are never lost.
-- A server needs free disk of roughly 2× the largest file while that file is being uploaded.
+- Uploads **stream to GitHub while they arrive**: the server needs only a few hundred MB of free disk and well under 300 MB of RAM, however big the file is (tune with *Push batch* in Settings → Performance, `ARK_STAGE_MB`).
 - Only `.zip` can be extracted in the browser. Names ending in `.arkparts` / `.arkenc`, called `.arkkeep` or `.git` are reserved.
 
 ## Development
