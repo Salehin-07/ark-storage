@@ -533,8 +533,8 @@ def create_app():
             if now - old.stat().st_mtime > 6 * 3600:
                 shutil.rmtree(old, ignore_errors=True)
         if not live:
-            with contextlib.suppress(Exception):
-                store.sweep_staging(live)
+            with contextlib.suppress(Exception):                # several worker processes: wait until a batch is seen idle twice
+                store.sweep_staging(live, confirm=int(os.environ.get("ARK_WORKERS", "1") or 1) > 1)
         chunk = config.get("chunk_mb") * 1048576
         need = min(total, config.get("stage_mb") * 1048576 + 3 * chunk) + 4 * UP_CHUNK + 64 * 1048576
         free = shutil.disk_usage(root).free
@@ -624,7 +624,7 @@ def create_app():
                 raise VfsError(f"'{f.get('path')}' was not fully received", 400)
             path = vfs.norm(f["path"])
             vfs.validate_name(vfs.basename(path))
-            plan.append((path, F["parts"], f.get("mtime")))
+            plan.append((path, F["parts"], f.get("mtime"), F["size"]))
         empty_dirs = [vfs.norm(p) for p in data.get("dirs", [])]
         title = f"Upload {len(plan)} file(s)" if len(plan) != 1 else f"Upload {vfs.basename(plan[0][0])}"
 
@@ -632,8 +632,8 @@ def create_app():
             ok = False
             try:
                 with store.tx(ingest=ing) as tx:
-                    for path, parts, mtime in plan:
-                        tx.put_staged(path, parts, ing.enc, mtime=(mtime / 1000 if mtime else None), policy=policy)
+                    for path, parts, mtime, size in plan:
+                        tx.put_staged(path, parts, ing.enc, mtime=(mtime / 1000 if mtime else None), policy=policy, expect=size)
                     for dd in empty_dirs:
                         tx.mkdir(dd)
                     job.update(0.85, "Pushing to GitHub")
@@ -852,6 +852,11 @@ def create_app():
             store.client._etags.clear()
             store.refresh(force=True)
             return jsonify(ok=True)
+        if action == "cleanup":
+            with up_lock:
+                live = set(uploads)
+            removed = store.sweep_staging(live)
+            return jsonify(ok=True, removed=removed, incomplete=len(store.refresh().files.incomplete))
         if action == "squash":
             return jsonify(job=jobs.start("squash", "Compact history", lambda j: store.squash()).to_dict())
         if action == "convert":
@@ -873,5 +878,23 @@ def create_app():
             store._master = None
             return jsonify(ok=True)
         raise VfsError("Unknown action", 404)
+
+    # Cleanup job: pieces pushed for an upload that never reached its manifest (crash, closed tab, failed commit) are
+    # removed in the background. A batch must be seen idle and unchanged on two passes before it goes.
+    def janitor():
+        stop = threading.Event()
+        stop.wait(300)
+        while not stop.is_set():
+            try:
+                if not store.problems():
+                    with up_lock:
+                        live = set(uploads)
+                    store.sweep_staging(live, confirm=True)
+            except Exception:                                   # noqa: BLE001 - best effort, retried next round
+                pass
+            stop.wait(1800)
+
+    if os.environ.get("ARK_JANITOR", "1") != "0" and not app.config.get("TESTING"):
+        threading.Thread(target=janitor, daemon=True, name="ark-janitor").start()
 
     return app

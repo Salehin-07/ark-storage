@@ -114,6 +114,7 @@
           card("Maintenance", "Safe to run any time.", h("div", { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
             btn("Refresh from GitHub", async () => { await api("/api/admin/refresh", { method: "POST", body: {} }); toast("Refreshed"); hooks.reload && hooks.reload(); }, "", "refresh"),
             btn("Clear cache", async () => { await api("/api/admin/clear-cache", { method: "POST", body: {} }); toast("Cache cleared"); }, ""),
+            btn("Clean up unfinished uploads", async () => { const r = await api("/api/admin/cleanup", { method: "POST", body: {} }); toast(r.removed ? "Removed " + r.removed + " leftover piece" + (r.removed === 1 ? "" : "s") : "Nothing to clean up"); }, ""),
             btn("Compact history", async () => {
               if (await ask("Compact history?", "Replaces the branch history with one commit holding your current files, so deleted data stops counting against the repository's size. Your files are unaffected. History (old versions) is lost.", { ok: "Compact" })) { await api("/api/admin/squash", { method: "POST", body: {} }); toast("Started — follow it in Transfers"); hooks.jobs && hooks.jobs(); }
             }, "danger"))));

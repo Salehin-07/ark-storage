@@ -311,11 +311,12 @@ class Tx:
             return False
         return self._cm.__exit__(*exc)
 
-    def put_staged(self, vpath, parts, enc, mtime=None, policy="replace"):
-        """Register a file whose pieces an Ingest already hashed (and maybe pushed)."""
+    def put_staged(self, vpath, parts, enc, mtime=None, policy="replace", expect=None):
+        """Register a file whose pieces an Ingest already hashed (and maybe pushed). `expect` is the plain size the
+        client announced; the commit refuses to publish the file unless its pieces add up to exactly that."""
         vpath = vfs.norm(vpath)
         vfs.validate_name(vfs.basename(vpath))
-        self.intents.append(dict(op="put", path=vpath, parts=parts, enc=enc, policy=policy,
+        self.intents.append(dict(op="put", path=vpath, parts=parts, enc=enc, policy=policy, expect=expect,
                                  mtime=int(mtime if mtime is not None else time.time())))
 
     # -- staging ---------------------------------------------------------------------------------
@@ -369,6 +370,7 @@ class Store:
         self._rlock = threading.RLock()
         self._wlock = threading.RLock()
         self._json_cache = {}
+        self._stale = {}                 # staging batches seen abandoned on the last cleanup pass: {batch: frozenset(paths)}
         self._master = None
         self.private = None
         self.last_error = ""
@@ -561,11 +563,27 @@ class Store:
                     time.sleep(1)
         ing.staged.clear()
 
-    def sweep_staging(self, live):
-        """Remove staging data of uploads that no longer exist (server restarted, tab closed...)."""
+    def sweep_staging(self, live, confirm=False):
+        """Remove the pieces of uploads that never made it into a manifest (server restarted, tab closed...).
+
+        With ``confirm`` a batch is only removed when it was already seen abandoned, unchanged, on the previous pass:
+        an upload that is still arriving (even in another worker process) keeps adding pieces, so it is never mistaken
+        for an abandoned one. Returns how many pieces were removed."""
         idx = self.refresh(force=True)
-        stale = [p for p, e in idx.entries.items() if p.startswith(STAGE) and e["type"] == "blob"
-                 and p[len(STAGE):].split("/")[0] not in live]
+        groups = {}
+        for p, e in idx.entries.items():
+            if p.startswith(STAGE) and e["type"] == "blob":
+                bid = p[len(STAGE):].split("/")[0]
+                if bid not in live:
+                    groups.setdefault(bid, []).append(p)
+        seen, self._stale = self._stale, {}
+        stale = []
+        for bid, paths in groups.items():
+            key = frozenset(paths)
+            if confirm and seen.get(bid) != key:
+                self._stale[bid] = key
+                continue
+            stale += paths
         if not stale:
             return 0
         branch = config.get("branch")
@@ -584,11 +602,44 @@ class Store:
         with self._wlock:
             return self._commit_locked(tx, message)
 
+    def _piece_ok(self, tx, idx, sha, size):
+        """Is this piece really there, with the size we hashed? On GitHub (staged) or in the local object store."""
+        ing = tx.ingest
+        if ing and sha in ing.staged:
+            e = idx.entries.get(f"{STAGE}{ing.bid}/{sha}")
+            if e and e.get("sha") == sha and e.get("size", size) == size:
+                return True
+        try:
+            out = tx.w.run(["cat-file", "-s", sha]).stdout.decode().strip()
+            return int(out) == size
+        except Exception:                                   # noqa: BLE001 - any failure means "not verified"
+            return False
+
+    def _verify_puts(self, tx, idx):
+        """Chunks first, manifest last. A file is published (its piece list written into the tree) only when every
+        piece is present with the right size and the pieces add up to the size the client announced. Otherwise
+        nothing changes: readers keep the previous complete file, and the orphaned pieces are removed by cleanup."""
+        for it in tx.intents:
+            if it["op"] != "put":
+                continue
+            parts, name = it["parts"], vfs.basename(it["path"])
+            for k, (sha, size) in enumerate(parts):
+                if not self._piece_ok(tx, idx, sha, size):
+                    raise VfsError(f"'{name}' was not saved: piece {k + 1} of {len(parts)} is missing or damaged, so "
+                                   "nothing was changed. Please upload it again.", 409)
+            want = it.get("expect")
+            if want is not None:
+                total = sum(sz for _sha, sz in parts)
+                if total != (crypto.encrypted_size(want) if it["enc"] else want):
+                    raise VfsError(f"'{name}' was not saved: its pieces don't add up to the size that was announced "
+                                   "(the upload was cut short), so nothing was changed.", 409)
+
     def _commit_locked(self, tx, message):
         branch = config.get("branch")
         last = None
         for _attempt in range(4):
             idx = self.refresh(force=True)
+            self._verify_puts(tx, idx)
             ops, results = self._apply(tx, idx)
             if tx.ingest and tx.ingest.staged:       # the files now exist for real: drop their staging entries
                 ops = ops + [(f"{STAGE}{tx.ingest.bid}/{x}", None, None) for x in sorted(tx.ingest.staged)]

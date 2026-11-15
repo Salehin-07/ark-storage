@@ -444,20 +444,68 @@
     const stage = h("div", { id: "vstage" }), title = h("div", { class: "t" }), count = h("span", { class: "muted" });
     const v = h("div", { id: "viewer", role: "dialog", "aria-label": "Viewer", tabindex: -1 },
       h("div", { class: "vbar" }, title, count, h("button", { class: "btn", type: "button", onclick: () => { const x = items[i]; downloadSel([x]); } }, icon("download"), h("span", { class: "lb" }, "Download")), h("button", { class: "btn icon", type: "button", "aria-label": "Close", onclick: close }, icon("x"))), stage);
+    let live = null;                                   // whatever must be torn down when the viewer moves on (PDF worker, blob URL, request)
+    const cleanup = () => { if (live) { try { live(); } catch (e) { /* already gone */ } live = null; } };
+    const failCard = (x) => h("div", { class: "vcard" }, h("div", null, "This file can't be shown in the browser."), h("button", { class: "btn primary", type: "button", onclick: () => downloadSel([x]) }, "Download"));
+    // Big files must never leave a blank screen: a spinner (and, where the size is known, a bar) shows until the first bytes are usable.
+    function loader(text) {
+      const fill = h("i"), bar = h("div", { class: "vprog" }, fill), label = h("span", null, text || "Loading…");
+      const box = h("div", { class: "vload" }, h("span", { class: "vspin" }), label, bar);
+      return { box, set(f, t) { if (t) label.textContent = t; if (f !== null && f !== undefined) { bar.classList.add("on"); fill.style.width = (Math.min(1, f) * 100).toFixed(1) + "%"; } }, done() { box.remove(); } };
+    }
+    function showImage(x, src, wrap) {
+      const ld = loader("Loading image…"); wrap.append(ld.box);
+      const ctl = new AbortController(); let url = null;
+      live = () => { ctl.abort(); if (url) URL.revokeObjectURL(url); };
+      fetch(src, { credentials: "same-origin", signal: ctl.signal }).then(async (r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const total = +r.headers.get("Content-Length") || 0, type = r.headers.get("Content-Type") || "";
+        if (!r.body || !total) { return r.blob(); }
+        const rd = r.body.getReader(), got = []; let n = 0;
+        for (;;) { const { done, value } = await rd.read(); if (done) break; got.push(value); n += value.length; ld.set(n / total, "Loading image… " + fmtBytes(n) + " of " + fmtBytes(total)); }
+        return new Blob(got, { type });
+      }).then((blob) => {
+        url = URL.createObjectURL(blob);
+        const img = h("img", { src: url, alt: x.name });
+        img.onerror = () => wrap.replaceChildren(failCard(x));
+        img.onload = () => ld.done();
+        wrap.append(img);
+      }).catch((e) => {
+        if (e.name === "AbortError") return;
+        // progress isn't available (or fetch failed): let the browser load the image itself, still with the spinner up
+        const img = h("img", { alt: x.name });
+        img.onload = () => ld.done();
+        img.onerror = () => wrap.replaceChildren(failCard(x));
+        img.src = src; wrap.append(img);
+      });
+    }
+    function showMedia(x, src, wrap, kind) {
+      const ld = loader(kind === "video" ? "Loading video…" : "Loading audio…"); wrap.append(ld.box);
+      const m = kind === "video" ? h("video", { src, controls: true, autoplay: false, playsInline: true, preload: "metadata" }) : h("audio", { src, controls: true, preload: "metadata" });
+      const hide = () => ld.done(), buffering = () => { if (!m.paused || m.readyState < 2) wrap.append(ld.box); };
+      m.addEventListener("loadedmetadata", hide); m.addEventListener("canplay", hide); m.addEventListener("playing", hide);
+      m.addEventListener("waiting", buffering); m.addEventListener("seeking", buffering); m.addEventListener("seeked", hide);
+      m.onerror = () => wrap.replaceChildren(failCard(x));
+      live = () => { m.pause(); m.removeAttribute("src"); m.load(); };
+      if (kind === "audio") wrap.replaceChildren(h("div", { class: "vcard" }, icon("audio"), h("div", null, x.name), m, ld.box)); else wrap.append(m);
+    }
     function show() {
+      cleanup();
       const x = items[i], src = "/api/raw?path=" + enc(x.path);
       title.textContent = x.name; count.textContent = items.length > 1 ? `${i + 1} / ${items.length}` : "";
-      let node;
-      if (x.kind === "image") node = h("img", { src, alt: x.name });
-      else if (x.kind === "video") node = h("video", { src, controls: true, autoplay: false, playsInline: true, preload: "metadata" });
-      else if (x.kind === "audio") node = h("div", { class: "vcard" }, icon("audio"), h("div", null, x.name), h("audio", { src, controls: true, preload: "metadata" }));
-      else node = h("iframe", { src, title: x.name });
-      if (node.tagName === "VIDEO" || node.tagName === "IMG") node.onerror = () => stage.replaceChildren(h("div", { class: "vcard" }, h("div", null, "This file can't be shown in the browser."), h("button", { class: "btn primary", type: "button", onclick: () => downloadSel([x]) }, "Download")));
-      stage.replaceChildren(...(items.length > 1 ? [h("button", { class: "btn icon vnav l", type: "button", "aria-label": "Previous", onclick: () => step(-1) }, "‹"), h("button", { class: "btn icon vnav r", type: "button", "aria-label": "Next", onclick: () => step(1) }, "›")] : []), node);
+      const wrap = h("div", { class: "vwrap" });
+      if (x.kind === "image") showImage(x, src, wrap);
+      else if (x.kind === "video" || x.kind === "audio") showMedia(x, src, wrap, x.kind);
+      else {
+        const host = h("div", { class: "pvhost" }); wrap.append(host);
+        const pv = window.PdfView.mount(host, src, { version: (document.querySelector("meta[name=ark-version]") || {}).content || "", onError: () => host.append(h("div", { class: "pvfail" }, h("button", { class: "btn primary", type: "button", onclick: () => downloadSel([x]) }, "Download"), h("a", { class: "btn", href: src, target: "_blank", rel: "noopener" }, "Open in new tab"))) });
+        live = () => pv.destroy();
+      }
+      stage.replaceChildren(...(items.length > 1 ? [h("button", { class: "btn icon vnav l", type: "button", "aria-label": "Previous", onclick: () => step(-1) }, "‹"), h("button", { class: "btn icon vnav r", type: "button", "aria-label": "Next", onclick: () => step(1) }, "›")] : []), wrap);
     }
     const step = (d) => { i = (i + d + items.length) % items.length; show(); };
     const onk = (e) => { if (e.key === "Escape") close(); else if (e.key === "ArrowRight" && !/AUDIO|VIDEO/.test(document.activeElement.tagName)) step(1); else if (e.key === "ArrowLeft" && !/AUDIO|VIDEO/.test(document.activeElement.tagName)) step(-1); };
-    function close() { document.removeEventListener("keydown", onk); v.remove(); }
+    function close() { cleanup(); document.removeEventListener("keydown", onk); v.remove(); }
     let tx = 0; v.addEventListener("touchstart", (e) => { tx = e.touches[0].clientX; }, { passive: true });
     v.addEventListener("touchend", (e) => { const dx = e.changedTouches[0].clientX - tx; if (Math.abs(dx) > 70 && items[i].kind === "image") step(dx < 0 ? 1 : -1); }, { passive: true });
     document.addEventListener("keydown", onk); document.body.append(v); show(); v.focus();

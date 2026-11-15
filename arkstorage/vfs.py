@@ -124,6 +124,7 @@ class Tree:
     def __init__(self):
         self.nodes = {"/": Node("/", "", True, repo="")}
         self.children = defaultdict(list)
+        self.incomplete = []            # repo paths of split files with missing pieces: never shown, never served
 
     def get(self, path):
         return self.nodes.get(path)
@@ -188,6 +189,9 @@ def build(entries, prefix, meta=None):
         if e["type"] == "tree":                        # split file
             pieces = sorted(parts_of.get(p, []), key=lambda x: x["path"])
             if not pieces:
+                continue
+            if [x["path"].rsplit("/", 1)[-1] for x in pieces] != [f"{k:04d}" for k in range(len(pieces))]:
+                tree.incomplete.append(p)                # a piece is missing: a reader must never see a half file
                 continue
             parts = [(x["path"], x["sha"], x.get("size", 0)) for x in pieces]
             _file(tree, vdir, name[:-len(SUF_PARTS)], True, parts, p, e["sha"], meta, repo_dir)

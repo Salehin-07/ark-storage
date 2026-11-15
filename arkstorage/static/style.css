@@ -148,6 +148,7 @@ a { color: var(--accent); }
 #viewer .vbar .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 #viewer .btn { background: rgba(255,255,255,.1); border-color: transparent; color: #fff; } #viewer .btn:hover { background: rgba(255,255,255,.2); }
 #vstage { flex: 1; min-height: 0; display: grid; place-items: center; position: relative; padding: 0 56px 16px; }
+#vstage .vwrap { width: 100%; height: 100%; min-height: 0; display: grid; place-items: center; position: relative; }
 #vstage img, #vstage video { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
 #vstage iframe { width: 100%; height: 100%; border: 0; background: #fff; border-radius: 6px; }
 #vstage audio { width: min(520px, 90%); } .vcard { text-align: center; display: grid; gap: 16px; place-items: center; }
@@ -211,3 +212,22 @@ a { color: var(--accent); }
 /* long folders stay fast: rows off screen are not laid out or painted */
 #list:not(.grid) .row { content-visibility: auto; contain-intrinsic-size: auto 46px; }
 @media (prefers-reduced-motion: reduce) { #sync::after, .spin { animation-duration: 2s !important; } .row.flash { animation: none; } }
+
+/* viewer: loading states and the PDF reader */
+@keyframes vspin { to { transform: rotate(360deg); } }
+.vspin { width: 22px; height: 22px; border-radius: 50%; border: 3px solid rgba(255,255,255,.25); border-top-color: #fff; animation: vspin .8s linear infinite; display: inline-block; flex: none; }
+.vload { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: #fff; font-size: 14px; pointer-events: none; z-index: 2; background: rgba(6,8,12,.35); }
+.vprog { width: min(320px, 70%); height: 4px; border-radius: 2px; background: rgba(255,255,255,.2); overflow: hidden; opacity: 0; } .vprog.on { opacity: 1; }
+.vprog i { display: block; height: 100%; width: 0; background: var(--accent-2); transition: width .2s ease-out; }
+#vstage .vcard audio { width: min(520px, 90%); }
+.pvhost { width: 100%; height: 100%; min-height: 0; display: flex; flex-direction: column; background: #1b1e25; border-radius: 6px; overflow: hidden; position: relative; }
+.pvbar { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: rgba(255,255,255,.06); flex: none; }
+.pvbar .pvinfo { flex: 1; font-size: 13px; font-variant-numeric: tabular-nums; } .pvbar .pvzoom { min-width: 44px; text-align: center; font-size: 12px; color: #c9ced8; }
+.pvprog { height: 3px; background: rgba(255,255,255,.12); flex: none; } .pvprog i { display: block; height: 100%; width: 0; background: var(--accent-2); transition: width .2s ease-out; }
+.pvscroll { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; padding: 10px 0 24px; }
+.pvpages { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.pvpage { background: #fff; position: relative; box-shadow: 0 1px 6px rgba(0,0,0,.45); flex: none; display: grid; place-items: center; color: #555; }
+.pvpage canvas { display: block; } .pvpage.loading .vspin { border-color: rgba(0,0,0,.15); border-top-color: #555; } .pvpage.ready .vspin { display: none; }
+.pvpage.bad { font-size: 13px; }
+.pvstatus { position: absolute; left: 0; right: 0; top: 70px; display: flex; align-items: center; justify-content: center; gap: 12px; color: #fff; font-size: 14px; pointer-events: none; } .pvstatus.bad { color: #ffb4ab; }
+.pvfail { position: absolute; left: 0; right: 0; top: 120px; display: flex; gap: 10px; justify-content: center; }

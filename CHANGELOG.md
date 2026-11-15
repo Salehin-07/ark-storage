@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.3
+- **An upload that stops halfway can no longer leave a half file.** Pieces are written first and the file only becomes visible
+  (its piece list is written into the tree, in the same commit) once every piece is present with the right size and the pieces
+  add up to the size the client announced. Otherwise nothing changes: readers keep getting the previous complete file, and the
+  commit fails with a clear message. A split file with a missing piece is never listed or served.
+- **Cleanup job for pieces that never made it into a file.** Early-pushed pieces of an abandoned upload (crash, closed tab,
+  failed commit) are removed in the background every 30 minutes, and by *Settings -> Maintenance -> Clean up unfinished uploads*.
+  A batch is only removed after it has been seen idle and unchanged twice, so an upload that is still arriving is never touched.
+- **PDFs open again.** The browser's own PDF viewer was refused inside the frame ("This content is blocked") and does not exist at
+  all on Android, so PDFs are now drawn by a bundled PDF.js reader (no CDN): fit-to-width, zoom, page counter.
+- **Big files never show a blank screen.** Every viewer shows a spinner at once; images show a progress bar while they download;
+  PDFs show how much has been fetched. PDFs are fetched by byte range and drawn lazily: the first page appears as soon as its bytes
+  arrive, the page you are looking at is drawn first (then the next one), and pages far away give their memory back.
+
 ## 1.0.2
 - **New logo** everywhere: favicon, Apple touch icon, installable-app (PWA) icons including a maskable one, and the sign-in
   card. The logo (and the product name) is gone from the top bar, which only needs the search box and its buttons.
