@@ -3,6 +3,7 @@ import base64
 import contextlib
 import functools
 import gzip
+import io
 import mimetypes
 import os
 import re
@@ -15,10 +16,10 @@ import zipfile
 from datetime import timedelta
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, make_response, request, send_from_directory, session
+from flask import Flask, Response, jsonify, make_response, request, send_file, send_from_directory, session
 from itsdangerous import BadSignature, URLSafeSerializer
 
-from . import __version__, auth, config, crypto, vfs, zipstream
+from . import __version__, auth, config, crypto, office, vfs, zipstream
 from .gh import GitHubError
 from .jobs import Jobs
 from .store import Ingest, Store
@@ -34,14 +35,30 @@ KINDS = {
     "pdf": {"pdf"},
     "archive": {"zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst", "jar", "apk", "iso", "dmg"},
     "binary": {"exe", "dll", "so", "bin", "dat", "class", "pyc", "o", "wasm", "ttf", "otf", "woff", "woff2",
-               "docx", "xlsx", "pptx", "doc", "xls", "ppt", "odt", "ods", "db", "sqlite", "psd", "img"},
+               "db", "sqlite", "psd", "img"},
+    # Word / Excel / PowerPoint / OpenDocument: shown in the browser (see static/office.js), not downloaded
+    "office": {"docx", "docm", "dotx", "dotm", "doc", "dot", "rtf", "odt", "xlsx", "xlsm", "xlsb", "xls", "ods",
+               "pptx", "pptm", "ppsx", "ppt", "pps", "odp"},
 }
+# Formats the browser renders itself; every other "office" type is converted to PDF on the server (needs LibreOffice).
+OFFICE_CLIENT = {"docx", "docm", "xlsx", "xlsm", "xlsb", "xls", "ods", "pptx", "pptm", "ppsx"}
 EXT_KIND = {e: k for k, exts in KINDS.items() for e in exts}
 # Browsers may run scripts from these when served from our origin, so they get a sandbox CSP.
 ACTIVE = {"html", "htm", "xhtml", "svg", "xml", "js", "mjs"}
 EXTRA_MIME = {"md": "text/plain", "py": "text/plain", "json": "application/json", "mkv": "video/x-matroska",
               "m4a": "audio/mp4", "opus": "audio/ogg", "flac": "audio/flac", "avif": "image/avif",
-              "webp": "image/webp", "heic": "image/heic"}
+              "webp": "image/webp", "heic": "image/heic",
+              "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              "docm": "application/vnd.ms-word.document.macroEnabled.12", "doc": "application/msword",
+              "dotx": "application/vnd.openxmlformats-officedocument.wordprocessingml.template", "dot": "application/msword",
+              "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              "xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12", "xls": "application/vnd.ms-excel",
+              "xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+              "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+              "ppsx": "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+              "ppt": "application/vnd.ms-powerpoint", "pps": "application/vnd.ms-powerpoint", "rtf": "application/rtf",
+              "odt": "application/vnd.oasis.opendocument.text", "ods": "application/vnd.oasis.opendocument.spreadsheet",
+              "odp": "application/vnd.oasis.opendocument.presentation"}
 
 
 def ext_of(name):
@@ -203,7 +220,7 @@ def create_app():
         a = auth.load()
         return jsonify(authed=bool(session.get("u")), user=session.get("u"), csrf=session["csrf"],
                        default_password=bool(a.get("default")) and bool(session.get("u")), version=__version__,
-                       theme=config.get("theme"))
+                       theme=config.get("theme"), office_convert=office.available())
 
     @app.post("/api/login")
     def login():
@@ -350,6 +367,29 @@ def create_app():
     def raw():
         return serve_file(need_file(request.args.get("path", "")), download=request.args.get("download") == "1")
 
+    @app.get("/api/preview-pdf")
+    @api
+    def preview_pdf():
+        """Old Office formats (.doc, .ppt, .odt, ...) as a PDF, converted once with LibreOffice when it is installed."""
+        n = need_file(request.args.get("path", ""))
+        if EXT_KIND.get(ext_of(n.name)) != "office" or ext_of(n.name) in OFFICE_CLIENT:
+            raise VfsError("This file is shown directly in the browser", 400)
+        path, data = office.to_pdf(n, store.reader(n, idx()))
+        if path:
+            r = send_file(path, mimetype="application/pdf", conditional=True, etag=f"{n.sha[:16]}p", max_age=0)
+        else:
+            r = send_file(io.BytesIO(data), mimetype="application/pdf", conditional=True, etag=False, max_age=0)
+        r.headers["Cache-Control"] = "private, max-age=0, must-revalidate" if path else "no-store"
+        return r
+
+    @app.post("/api/warm")
+    @api
+    def warm():
+        """Start downloading the first pieces of a file in the background (called when the pointer rests on it)."""
+        n = need_file(body().get("path", ""))
+        store.prefetch([p[1] for p in n.parts[:3]])
+        return Response(status=204)
+
     @app.get("/api/zip")
     @api
     def zip_download():
@@ -381,7 +421,7 @@ def create_app():
     @api
     def read_text():
         n = need_file(request.args.get("path", ""))
-        if EXT_KIND.get(ext_of(n.name)) in ("archive", "binary", "image", "video", "audio", "pdf"):
+        if EXT_KIND.get(ext_of(n.name)) in ("archive", "binary", "image", "video", "audio", "pdf", "office"):
             return jsonify(error="This looks like a binary or compressed file, so it can't be edited as text.", binary=True), 415
         if n.size > TEXT_LIMIT:
             return jsonify(error=f"File is larger than {TEXT_LIMIT // 1048576} MB; download it instead.", binary=True), 413
@@ -780,7 +820,8 @@ def create_app():
     def status():
         out = {"version": __version__, "problems": store.problems(), "branch": config.get("branch"),
                "repo_url": config.get("repo_url"), "git": bool(shutil.which("git")), "crypto": store.crypto_state(),
-               "cache_bytes": store.cache.size(), "last_error": store.last_error, "trash": bool(config.get("trash"))}
+               "cache_bytes": store.cache.size(), "last_error": store.last_error, "trash": bool(config.get("trash")),
+               "office_convert": office.available()}
         if not out["problems"]:
             try:
                 info = repo_info()

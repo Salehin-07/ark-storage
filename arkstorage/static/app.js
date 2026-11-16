@@ -36,7 +36,7 @@
     try { s = pre.session ? await pre.session : null; } catch (e) { s = null; }
     pre.session = null;
     if (!s || !("csrf" in s)) { try { s = await api("/api/session"); } catch (e) { document.body.textContent = e.message; return; } }
-    S.csrf = s.csrf;
+    S.csrf = s.csrf; S.officeConvert = !!s.office_convert;
     applyTheme(s.theme);
     if (s.authed) { st.user = s.user; start(s); } else showLogin();
   }
@@ -144,6 +144,15 @@
     inflight.add(path); const g = gen;
     api("/api/list?path=" + enc(path)).then((d) => { if (g === gen) cacheDir(path, d); }).catch(() => {}).finally(() => inflight.delete(path));
   }
+  // Files that open in the viewer start downloading as soon as the pointer rests on them (or a finger touches them),
+  // so by the time the click lands the first pieces are already on the server.
+  const VIEWABLE = ["image", "video", "audio", "pdf", "office"], warmed = new Set();
+  function warmFile(path) {
+    if (warmed.has(path)) return;
+    warmed.add(path); if (warmed.size > 200) warmed.delete(warmed.values().next().value);
+    api("/api/warm", { method: "POST", body: { path } }).catch(() => warmed.delete(path));
+  }
+  const warmable = (row) => row && !row.dataset.dir && !row.dataset.pending && st.mode === "files" && VIEWABLE.includes(row.dataset.kind);
   function applyDir(d) {
     st.entries = d.entries; st.crumbs = d.crumbs; st.head = d.head; st.loadErr = "";
     st.sel = FC.pruneSelection(st.entries.map((e) => e.path), st.sel);
@@ -208,7 +217,7 @@
   }
 
   // ------------------------------------------------------------ rendering
-  const KIND_ICON = { dir: "folder", image: "image", video: "video", audio: "audio", pdf: "pdf", archive: "archive", text: "code", binary: "file", file: "file" };
+  const KIND_ICON = { dir: "folder", image: "image", video: "video", audio: "audio", pdf: "pdf", office: "file", archive: "archive", text: "code", binary: "file", file: "file" };
   function sorted(list) {
     const { key, dir } = st.sort;
     const k = (e) => key === "size" ? e.size : key === "mtime" ? e.mtime : key === "kind" ? (e.name.split(".").pop() || "") : e.name.toLowerCase();
@@ -277,7 +286,7 @@
       h("div", { class: "sz" }, e.dir ? (e.items != null ? e.items + (e.items === 1 ? " item" : " items") : "") : fmtBytes(e.size)),
       h("div", { class: "md" }, fmtDate(e.mtime)));
     r.dataset.path = e.path;
-    if (e.dir) r.dataset.dir = "1";
+    if (e.dir) r.dataset.dir = "1"; else r.dataset.kind = e.kind;
     if (e.pending) r.dataset.pending = "1";
     return r;
   }
@@ -330,6 +339,7 @@
       lastPointer = e.pointerType || "mouse";
       const row = e.target.closest(".row");
       if (row && row.dataset.dir && !row.dataset.pending && st.mode === "files") prefetchDir(row.dataset.path);   // the click follows ~100 ms later
+      else if (warmable(row)) warmFile(row.dataset.path);
       if (lastPointer === "touch" && row && !e.target.closest(".chk")) {
         pressed = false;
         const sx = e.clientX, sy = e.clientY;
@@ -343,6 +353,7 @@
       const row = e.pointerType === "touch" ? null : e.target.closest(".row");
       clearTimeout(hoverT);
       if (row && row.dataset.dir && !row.dataset.pending && st.mode === "files") hoverT = setTimeout(() => prefetchDir(row.dataset.path), 90);
+      else if (warmable(row)) hoverT = setTimeout(() => warmFile(row.dataset.path), 150);
     });
     L.addEventListener("click", (e) => {
       if (pressed) { pressed = false; return; }
@@ -432,14 +443,14 @@
     const e = st.entries.find((x) => x.path === path); if (!e) return;
     if (e.pending) { toast("Saving “" + e.name + "”…"); whenIdle().then(() => { const n = st.entries.find((x) => x.path === path); if (n) openPath(path); }); return; }
     if (e.dir) { go(e.path); return; }
-    if (["image", "video", "audio", "pdf"].includes(e.kind)) return openViewer(e);
+    if (VIEWABLE.includes(e.kind)) return openViewer(e);
     if (e.kind === "archive" || e.kind === "binary") { toast("Can't preview this type; downloading instead"); return downloadSel([e]); }
     editPath(e);
   }
   function editPath(e) { window.Editor.open(e.path, e.name, () => reload()).then((ok) => { if (ok === false && /\.(zip|rar|7z|tar|gz)$/i.test(e.name)) downloadSel([e]); }); }
 
   function openViewer(entry) {
-    const items = (st.shown || []).filter((x) => ["image", "video", "audio", "pdf"].includes(x.kind));
+    const items = (st.shown || []).filter((x) => VIEWABLE.includes(x.kind));
     let i = Math.max(0, items.findIndex((x) => x.path === entry.path));
     const stage = h("div", { id: "vstage" }), title = h("div", { class: "t" }), count = h("span", { class: "muted" });
     const v = h("div", { id: "viewer", role: "dialog", "aria-label": "Viewer", tabindex: -1 },
@@ -489,6 +500,22 @@
       live = () => { m.pause(); m.removeAttribute("src"); m.load(); };
       if (kind === "audio") wrap.replaceChildren(h("div", { class: "vcard" }, icon("audio"), h("div", null, x.name), m, ld.box)); else wrap.append(m);
     }
+    // Word / Excel / PowerPoint are drawn in the browser; old formats (.doc, .ppt, .odt ...) come back from the server as a PDF.
+    function showOffice(x, src, wrap) {
+      const host = h("div", { class: "pvhost" }), ver = (document.querySelector("meta[name=ark-version]") || {}).content || "";
+      const ext = window.OfficeView.extOf(x.name), fam = window.OfficeView.familyOf(ext);
+      const fail = (msg) => { host.replaceChildren(h("div", { class: "vcard" }, h("div", null, msg || "This file can't be shown in the browser."), h("button", { class: "btn primary", type: "button", onclick: () => downloadSel([x]) }, "Download"))); };
+      wrap.append(host);
+      if (fam === "convert") {
+        if (!S.officeConvert) return fail("Previewing ." + ext + " files needs LibreOffice on the server. You can download the file instead.");
+        const pv = window.PdfView.mount(host, "/api/preview-pdf?path=" + enc(x.path), { version: ver, onError: () => fail("This file couldn't be converted for preview.") });
+        live = () => pv.destroy();
+        return;
+      }
+      const ld = loader("Loading " + (fam === "sheet" ? "spreadsheet" : fam === "slides" ? "presentation" : "document") + "…"); wrap.append(ld.box);
+      const ov = window.OfficeView.mount(host, src, { ext, version: ver, ui: ld, onError: (e) => fail(e && e.message ? "Can't open this file: " + e.message : null) });
+      live = () => ov.destroy();
+    }
     function show() {
       cleanup();
       const x = items[i], src = "/api/raw?path=" + enc(x.path);
@@ -496,6 +523,7 @@
       const wrap = h("div", { class: "vwrap" });
       if (x.kind === "image") showImage(x, src, wrap);
       else if (x.kind === "video" || x.kind === "audio") showMedia(x, src, wrap, x.kind);
+      else if (x.kind === "office") showOffice(x, src, wrap);
       else {
         const host = h("div", { class: "pvhost" }); wrap.append(host);
         const pv = window.PdfView.mount(host, src, { version: (document.querySelector("meta[name=ark-version]") || {}).content || "", onError: () => host.append(h("div", { class: "pvfail" }, h("button", { class: "btn primary", type: "button", onclick: () => downloadSel([x]) }, "Download"), h("a", { class: "btn", href: src, target: "_blank", rel: "noopener" }, "Open in new tab"))) });

@@ -9,7 +9,8 @@ browser, while the actual data lives in a repo you control, private or public, p
   phones), drag & drop (also onto folders), copy/cut/paste, rename, move, delete with **trash and restore**, properties,
   keyboard shortcuts, breadcrumbs, responsive layout for phones.
 - **Upload files or whole folders**: chunked uploads with progress, conflict choices (skip / keep both / replace), folder drag & drop.
-- **Preview**: images, video and audio (with seeking), PDF, plus a **code editor** (auto-indent, auto-closing brackets and quotes,
+- **Preview**: images, video and audio (with seeking), PDF, **Word / Excel / PowerPoint** (`.docx .xlsx .xls .ods .pptx` in the browser;
+  old `.doc .ppt .odt .rtf` via LibreOffice if installed, see `WITH_OFFICE` in the Dockerfile), plus a **code editor** (auto-indent, auto-closing brackets and quotes,
   comment toggle, find & replace, adjustable font size, unsaved-changes guard). Binary and compressed files are never opened as text.
 - **Files over 100 MB**: GitHub caps a file at 100 MB, so bigger files are split into pieces (default 48 MB) and joined on the fly.
   Ranged reads work across pieces, so a 4 GB video still seeks.

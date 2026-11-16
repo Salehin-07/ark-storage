@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import requests
+import requests.adapters
 
 from . import config
 
@@ -57,6 +58,9 @@ def scrub(text):
 class Client:
     def __init__(self):
         self.s = requests.Session()
+        # reuse connections: parallel piece downloads each used to wait for a fresh TLS handshake once the default pool of 10 was busy
+        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32)
+        self.s.mount("https://", adapter)
         self._etags = {}
 
     @property

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.4
+- **Word, Excel and PowerPoint files open in the file browser** instead of downloading. `.docx`/`.docm` are drawn like pages, `.xlsx`/`.xlsm`/`.xlsb`/`.xls`/`.ods`
+  as sheets (tabs, merged cells, sticky headers, more rows load as you scroll), `.pptx`/`.ppsx` as slides. Everything is rendered in the browser
+  by bundled libraries (no CDN), downloaded only the first time you open such a file. Documents are shown in a sandboxed frame without scripts.
+- **Old formats** (`.doc .dot .ppt .pps .odt .odp .rtf`) are converted once to PDF on the server and shown in the PDF viewer, when LibreOffice is
+  installed (Docker: `--build-arg WITH_OFFICE=1`). Without it the viewer offers a download. Encrypted files are converted in memory, never cached readable.
+- **Faster file loading.** Hovering or touching a previewable file starts fetching its first pieces right away; the disk cache no longer re-scans every
+  file after each download; GitHub connections are reused (bigger pool); more pieces are prefetched ahead of a read.
+- Office files are no longer offered for editing as text.
+
 ## 1.0.3
 - **An upload that stops halfway can no longer leave a half file.** Pieces are written first and the file only becomes visible
   (its piece list is written into the tree, in the same commit) once every piece is present with the right size and the pieces

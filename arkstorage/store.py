@@ -30,6 +30,7 @@ class Cache:
         self.dir = config.DATA_DIR / "cache"
         self._locks = {}
         self._glock = threading.Lock()
+        self._total = None               # running size of the cache; None = not measured yet
 
     def path(self, sha):
         return self.dir / sha[:2] / sha
@@ -46,8 +47,24 @@ class Cache:
             if not p.exists():
                 p.parent.mkdir(parents=True, exist_ok=True)
                 self.client.download_blob(sha, str(p))
-                self.evict(keep=sha)
+                self._added(p, sha)
         return p
+
+    def _added(self, p, sha):
+        """Count a new blob and only walk the cache directory when it may be over the limit
+        (it used to be walked, every file stat'ed, after every single download)."""
+        try:
+            size = p.stat().st_size
+        except OSError:
+            return
+        with self._glock:
+            if self._total is None:
+                self._total = None if not self.dir.exists() else sum(e[1] for e in self.entries())
+            else:
+                self._total += size
+            over = self._total is not None and self._total > config.get("cache_mb") * 1024 * 1024
+        if over:
+            self.evict(keep=sha)
 
     def entries(self):
         out = []
@@ -76,9 +93,11 @@ class Cache:
             with contextlib.suppress(OSError):
                 f.unlink()
                 total -= sz
+        self._total = total
 
     def clear(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+        self._total = None
 
 
 class Reader:
@@ -98,7 +117,7 @@ class Reader:
             if off < pos + sz and n > 0:
                 f = self._open.get(sha)
                 if f is None:
-                    self.store.prefetch([p[1] for p in self.parts[k + 1:k + 3]])
+                    self.store.prefetch([p[1] for p in self.parts[k + 1:k + 4]])
                     f = self._open[sha] = open(self.store.cache.ensure(sha), "rb")
                 f.seek(off - pos)
                 chunk = f.read(min(n, pos + sz - off))
@@ -374,7 +393,7 @@ class Store:
         self._master = None
         self.private = None
         self.last_error = ""
-        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ark-prefetch")
+        self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ark-prefetch")
 
     def prefetch(self, shas):
         """Warm the disk cache with the next pieces of a file being read (hides GitHub latency)."""

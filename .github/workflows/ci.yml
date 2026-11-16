@@ -17,3 +17,4 @@ jobs:
       - run: npm i --no-save jsdom && JSDOM_PATH=node_modules/jsdom node tests/ui_smoke.js
       - run: node tests/progress_test.js
       - run: node tests/pdfview_test.js
+      - run: JSDOM_PATH=node_modules/jsdom node tests/office_test.js

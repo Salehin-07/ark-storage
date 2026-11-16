@@ -3,6 +3,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 LABEL org.opencontainers.image.source="https://github.com/Salehin-07/ark-storage" \
       org.opencontainers.image.description="Ark Storage: your own cloud drive, stored in a GitHub repository" \
       org.opencontainers.image.licenses="MIT"
+# Optional: docker build --build-arg WITH_OFFICE=1 . adds LibreOffice so old .doc/.ppt/.odt/.rtf files can be previewed (~500 MB larger)
+ARG WITH_OFFICE=0
+RUN if [ "$WITH_OFFICE" = "1" ]; then apt-get update && apt-get install -y --no-install-recommends libreoffice-writer libreoffice-impress fonts-liberation fonts-noto-core && rm -rf /var/lib/apt/lists/*; fi
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

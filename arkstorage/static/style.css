@@ -231,3 +231,21 @@ a { color: var(--accent); }
 .pvpage.bad { font-size: 13px; }
 .pvstatus { position: absolute; left: 0; right: 0; top: 70px; display: flex; align-items: center; justify-content: center; gap: 12px; color: #fff; font-size: 14px; pointer-events: none; } .pvstatus.bad { color: #ffb4ab; }
 .pvfail { position: absolute; left: 0; right: 0; top: 120px; display: flex; gap: 10px; justify-content: center; }
+
+/* Office viewer (Word / Excel / PowerPoint) */
+.oxbar { justify-content: flex-end; }
+.oxframe { flex: 1; min-height: 0; position: relative; overflow: hidden; background: #4b4f56; }
+.oxframe iframe { position: absolute; left: 0; top: 0; border: 0; background: #4b4f56; transform-origin: 0 0; border-radius: 0; }
+.oxsheet { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--panel); color: var(--text); }
+.oxscroll { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
+.oxtable { border-collapse: separate; border-spacing: 0; font-size: 13px; min-width: 100%; }
+.oxtable th, .oxtable td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 3px 8px; white-space: pre; max-width: 420px; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+.oxtable td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.oxtable thead th { position: sticky; top: 0; z-index: 2; background: var(--panel-2); color: var(--muted); font-weight: 600; text-align: center; }
+.oxtable tbody th { position: sticky; left: 0; z-index: 1; background: var(--panel-2); color: var(--muted); font-weight: 500; text-align: right; min-width: 44px; }
+.oxtable thead th.corner { left: 0; z-index: 3; }
+.oxmore, .oxempty { padding: 12px; text-align: center; }
+.oxtabs { display: flex; gap: 2px; overflow-x: auto; border-top: 1px solid var(--line); background: var(--panel-2); padding: 4px 6px; }
+.oxtab { border: 0; background: transparent; padding: 6px 12px; border-radius: 6px; cursor: pointer; white-space: nowrap; color: var(--muted); }
+.oxtab.on { background: var(--panel); color: var(--text); font-weight: 600; box-shadow: 0 0 0 1px var(--line); }
+.ic.office { color: #2b6cb0; }
