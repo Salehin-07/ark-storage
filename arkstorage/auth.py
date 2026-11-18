@@ -1,4 +1,10 @@
-"""Single-account login (default ark / ark, changeable in Settings)."""
+"""Single-account login (default ark / ark, changeable in Settings).
+
+Password hashing (scrypt) takes tens of milliseconds of CPU, so it runs in a worker thread: a
+login attempt can never freeze the event loop for everyone else. The hash format is unchanged,
+so an ``auth.json`` written by v1.x keeps working.
+"""
+import hmac
 import json
 import os
 import threading
@@ -6,7 +12,7 @@ import time
 
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from . import config
+from . import aio, config
 
 _lock = threading.Lock()
 _fails = {}          # ip -> (count, first_fail_ts)
@@ -48,12 +54,14 @@ def locked_out(ip):
     return 0
 
 
-def verify(username, password, ip):
+async def verify(username, password, ip):
     wait = locked_out(ip)
     if wait:
         return False, wait
-    d = load()
-    ok = username == d["username"] and check_password_hash(d["hash"], password or "")
+    d = await aio.run(load)
+    # always run the hash, so a wrong username takes as long as a wrong password
+    pw_ok = await aio.run(check_password_hash, d["hash"], password or "")
+    ok = pw_ok and hmac.compare_digest(username.encode(), d["username"].encode())
     if ok:
         _fails.pop(ip, None)
         return True, 0
@@ -62,9 +70,9 @@ def verify(username, password, ip):
     return False, 0
 
 
-def change(current, new_username=None, new_password=None):
-    d = load()
-    if not check_password_hash(d["hash"], current or ""):
+async def change(current, new_username=None, new_password=None):
+    d = await aio.run(load)
+    if not await aio.run(check_password_hash, d["hash"], current or ""):
         raise ValueError("Current password is wrong")
     if new_username:
         if not 1 <= len(new_username) <= 64:
@@ -73,7 +81,7 @@ def change(current, new_username=None, new_password=None):
     if new_password:
         if len(new_password) < 4:
             raise ValueError("Password must be at least 4 characters")
-        d["hash"] = generate_password_hash(new_password)
+        d["hash"] = await aio.run(generate_password_hash, new_password)
         d["default"] = False
-    _save(d)
+    await aio.run(_save, d)
     return d

@@ -31,7 +31,7 @@ git clone https://github.com/Salehin-07/ark-storage && cd ark-storage
 pip install -r requirements.txt          # needs git on PATH
 export ARK_REPO_URL=https://github.com/you/your-storage
 export ARK_GITHUB_TOKEN=github_pat_xxx
-gunicorn -c gunicorn.conf.py wsgi:app    # or: python wsgi.py
+python -m arkstorage                   # uvicorn (uvloop + httptools); or: uvicorn arkstorage.asgi:app
 ```
 
 Open <http://localhost:8000>, sign in with `ark` / `ark` and change the password under **Settings → Account**.

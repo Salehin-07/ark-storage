@@ -110,6 +110,20 @@ def decrypt_range(master: bytes, read_at, enc_size: int, start: int, end: int):
         yield pt[lo:hi]
 
 
+def stored_span(enc_size: int, start: int, end: int):
+    """Ciphertext byte ranges ``[(a, b), ...]`` that ``decrypt_range`` will read for plaintext [start, end).
+
+    Lets an async caller make sure the right stored pieces are on disk before decrypting in a worker thread.
+    """
+    total = plain_size(enc_size)
+    end = min(end, total)
+    first = start // SEG if start < end else 0
+    last = (end - 1) // SEG if start < end else 0
+    lo = HEADER + first * (SEG + TAG)
+    hi = min(enc_size, HEADER + (last + 1) * (SEG + TAG))
+    return [(0, HEADER), (lo, hi)]
+
+
 def _open_seg(aes, header, read_at, i, plen, final):
     off = HEADER + i * (SEG + TAG)
     ct = read_at(off, plen + TAG)

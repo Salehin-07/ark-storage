@@ -4,13 +4,13 @@ from pathlib import Path
 
 from arkstorage import office
 from arkstorage.app import kind_of, mime_of
-from tests.helpers import sandbox
-from tests.test_api import Api
+from tests.helpers import ApiCase, sandbox
+from tests.api_harness import Api
 
 DOC = Path("/tmp/samples/report.doc")
 
 
-class OfficeTests(unittest.TestCase):
+class OfficeTests(ApiCase):
     def test_kinds_and_mimes(self):
         for n in ("a.docx", "a.DOC", "b.xlsx", "b.xls", "c.pptx", "c.ppt", "d.odt", "e.ods", "f.rtf"):
             self.assertEqual(kind_of(n), "office", n)

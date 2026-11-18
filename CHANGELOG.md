@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.0.0 - async rewrite on FastAPI + uvicorn
+
+**Faster, with the same UI and the same repository format.** Measured over real HTTP on loopback with a local git repo
+standing in for GitHub (1 worker, v1.0.4 gunicorn 16 threads vs v2.0.0 uvicorn):
+
+| scenario | v1.0.4 | v2.0.0 |
+|---|---|---|
+| list a 2000-entry folder, 32 connections | 68 req/s, p99 1000 ms | 1800 req/s, p99 35 ms |
+| tiny JSON, 64 connections | 1200 req/s | 2650 req/s |
+| 32 listing clients + 60 slow downloaders | 3 req/s, dropped connections | 850 req/s, no errors |
+| 8 MB cached download, 8 connections | ~635 MB/s | ~565 MB/s (loopback; GitHub is the real limit) |
+
+* Flask/gunicorn -> **FastAPI/uvicorn** (uvloop, httptools). Start with `python -m arkstorage`.
+* GitHub client is async (httpx, pooled HTTP/1.1); piece downloads are shared tasks with read-ahead prefetch.
+* Uploads, downloads, zip streaming, compress/extract, Office conversion and jobs are async; git/hash/AES/deflate run in worker threads.
+* Stale-while-revalidate listings, per-state rendered-listing cache, orjson.
+* Slow clients no longer occupy a worker thread each (the old server stalled at 16 concurrent transfers).
+* Sessions are a signed cookie again, implemented in ASGI: everyone signs in once after upgrading. Share links keep working.
+* Removed: `wsgi.py`, `gunicorn.conf.py`, Flask, requests. New env: `ARK_FORWARDED_ALLOW_IPS`, `ARK_COOKIE_SECURE`, `ARK_DOCS`, `ARK_JANITOR`.
+
 ## 1.0.4
 - **Word, Excel and PowerPoint files open in the file browser** instead of downloading. `.docx`/`.docm` are drawn like pages, `.xlsx`/`.xlsm`/`.xlsb`/`.xls`/`.ods`
   as sheets (tabs, merged cells, sticky headers, more rows load as you scroll), `.pptx`/`.ppsx` as slides. Everything is rendered in the browser

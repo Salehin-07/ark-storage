@@ -1,56 +1,13 @@
 import io
 import os
-import time
 import unittest
 import zipfile
 
-from arkstorage.app import create_app
-from tests.helpers import FakeClient, FakeGit, sandbox
+from tests.api_harness import Api
+from tests.helpers import ApiCase, sandbox
 
 
-class Api:
-    def __init__(self, store, remote):
-        self.app = create_app()
-        st = self.app.ark_store
-        st.client, st.git = FakeClient(remote), FakeGit(remote)
-        st.cache.client, st.cache.dir = st.client, st.cache.dir
-        self.st, self.c = st, self.app.test_client()
-        self.csrf = ""
-
-    def login(self, user="ark", pw="ark"):
-        r = self.c.post("/api/login", json={"username": user, "password": pw})
-        if r.status_code == 200:
-            self.csrf = r.get_json()["csrf"]
-        return r
-
-    def call(self, method, url, **kw):
-        h = kw.pop("headers", {})
-        h["X-CSRF-Token"] = self.csrf
-        return getattr(self.c, method)(url, headers=h, **kw)
-
-    def job(self, resp):
-        jid = resp.get_json()["job"]["id"]
-        for _ in range(200):
-            j = self.call("get", f"/api/jobs/{jid}").get_json()
-            if j["state"] != "running":
-                assert j["state"] == "done", j
-                return j
-            time.sleep(0.1)
-        raise AssertionError("job timeout")
-
-    def upload(self, files, dest="/", policy="rename"):
-        b = self.call("post", "/api/upload/begin", json={"files": [{"id": f"f{i}", "size": len(d)} for i, (n, d) in enumerate(files)]}).get_json()["batch"]
-        for i, (_n, d) in enumerate(files):
-            for off in range(0, max(1, len(d)), 700_000):
-                r = self.call("put", f"/api/upload/{b}/f{i}?offset={off}", data=d[off:off + 700_000])
-                assert r.status_code == 200, r.get_json()
-        r = self.call("post", f"/api/upload/{b}/commit", json={"files": [
-            {"id": f"f{i}", "path": (dest.rstrip("/") + "/" + n), "mtime": 1700000000000} for i, (n, d) in enumerate(files)], "on_conflict": policy})
-        assert r.status_code == 200, r.get_json()
-        return self.job(r)
-
-
-class ApiTests(unittest.TestCase):
+class ApiTests(ApiCase):
     def test_auth_required_and_csrf(self):
         with sandbox() as (st, remote):
             a = Api(st, remote)
@@ -118,7 +75,7 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(a.call("get", "/api/raw?path=/docs/hi.txt").data, b"changed")
             # share link works without a session
             link = a.call("post", "/api/share", json={"path": "/docs/hi.txt", "hours": 1}).get_json()["url"]
-            anon = a.app.test_client()
+            anon = a.anon()
             self.assertEqual(anon.get(link.replace("http://localhost", "")).data, b"changed")
             self.assertEqual(anon.get("/s/garbage").status_code, 404)
             # compress + extract round trip
@@ -188,7 +145,7 @@ class ApiTests(unittest.TestCase):
             self.assertNotIn("icon.svg", html)
             for png in ("icon-32.png", "icon-192.png", "icon-512.png", "icon-maskable-512.png", "apple-touch-icon.png"):
                 r = a.c.get("/static/" + png)
-                self.assertEqual((r.status_code, r.mimetype), (200, "image/png"), png)
+                self.assertEqual((r.status_code, r.headers["content-type"]), (200, "image/png"), png)
             self.assertEqual(a.c.get("/favicon.ico").status_code, 200)
             icons = a.c.get("/manifest.webmanifest").get_json()["icons"]
             self.assertTrue(icons and all(i["type"] == "image/png" for i in icons))
@@ -196,13 +153,12 @@ class ApiTests(unittest.TestCase):
             self.assertIn("immutable", a.c.get("/static/app.js?v=1").headers["Cache-Control"])
             self.assertEqual(a.c.get("/static/app.js").headers["Cache-Control"], "no-cache")
             # text is gzipped when the browser accepts it, and is identical once decoded
-            import gzip
-            raw = a.c.get("/static/app.js").get_data()
+            raw = a.c.get("/static/app.js", headers={"Accept-Encoding": "identity"})
             z = a.c.get("/static/app.js", headers={"Accept-Encoding": "gzip"})
             self.assertEqual(z.headers.get("Content-Encoding"), "gzip")
-            self.assertEqual(gzip.decompress(z.get_data()), raw)
-            self.assertLess(len(z.get_data()), len(raw) // 2)
-            self.assertIsNone(a.c.get("/static/app.js").headers.get("Content-Encoding"))
+            self.assertEqual(z.get_data(), raw.get_data())
+            self.assertLess(z.num_bytes_downloaded, len(raw.get_data()) // 2)
+            self.assertIsNone(raw.headers.get("Content-Encoding"))
             png = a.c.get("/static/icon-512.png", headers={"Accept-Encoding": "gzip"})
             self.assertIsNone(png.headers.get("Content-Encoding"))      # already compressed: left alone
 

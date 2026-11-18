@@ -4,8 +4,8 @@ import os
 import unittest
 
 from arkstorage import vfs
-from tests.helpers import sandbox
-from tests.test_api import Api
+from tests.api_harness import Api
+from tests.helpers import ApiCase, run, sandbox
 from tests.test_streaming import begin, commit, git, put_chunks
 
 BRANCH = "refs/heads/ark-data"
@@ -15,7 +15,7 @@ def staged(remote):
     return [p for p in git(remote, "ls-tree", "-r", "--name-only", BRANCH).splitlines() if p.startswith(".ark/staging/")]
 
 
-class AtomicUploadTests(unittest.TestCase):
+class AtomicUploadTests(ApiCase):
     def test_cut_short_upload_keeps_previous_file_and_cleanup_removes_pieces(self):
         with sandbox(stage_mb=1, chunk_mb=1) as (st, remote):
             a = Api(st, remote)
@@ -39,7 +39,7 @@ class AtomicUploadTests(unittest.TestCase):
             # the server restarts: the unfinished batch has no owner any more
             a2 = Api(st, remote)
             a2.login()
-            removed = st.sweep_staging(set())
+            removed = run(st.sweep_staging(set()))
             self.assertGreater(removed, 0)
             self.assertEqual(staged(remote), [])
             self.assertEqual(a2.call("get", "/api/raw?path=/doc.bin").data, old)
@@ -51,28 +51,36 @@ class AtomicUploadTests(unittest.TestCase):
 
     def test_commit_refuses_when_pieces_do_not_add_up(self):
         with sandbox(chunk_mb=1) as (st, remote):
-            with st.tx() as tx:
-                tx.put_bytes("/x.bin", os.urandom(2_500_000))
-                st.commit(tx, "seed")
+            async def seed():
+                async with st.tx() as tx:
+                    await tx.put_bytes("/x.bin", os.urandom(2_500_000))
+                    await st.commit(tx, "seed")
+            run(seed())
             head = git(remote, "rev-parse", BRANCH)
             data = os.urandom(3_000_000)
-            with st.tx() as tx:
-                tx.put_bytes("/x.bin", data)
-                tx.intents[-1]["expect"] = len(data) + 1                         # announced size disagrees with the pieces
-                with self.assertRaises(vfs.VfsError) as cm:
-                    st.commit(tx, "bad")
-                self.assertEqual(cm.exception.status if hasattr(cm.exception, "status") else 409, 409)
+
+            async def bad():
+                async with st.tx() as tx:
+                    await tx.put_bytes("/x.bin", data)
+                    tx.intents[-1]["expect"] = len(data) + 1                     # announced size disagrees with the pieces
+                    with self.assertRaises(vfs.VfsError) as cm:
+                        await st.commit(tx, "bad")
+                    self.assertEqual(cm.exception.status, 409)
+            run(bad())
             self.assertEqual(git(remote, "rev-parse", BRANCH), head, "a refused commit must not move the branch")
 
     def test_commit_refuses_when_a_piece_is_missing(self):
         with sandbox(chunk_mb=1) as (st, remote):
-            with st.tx() as tx:
-                tx.put_bytes("/y.bin", os.urandom(2_200_000))
-                parts = tx.intents[-1]["parts"]
-                tx.w.drop([parts[1][0]])                                        # a piece vanishes before the manifest is written
-                head = git(remote, "rev-parse", BRANCH) if git(remote, "branch", "--list") else ""
-                with self.assertRaises(vfs.VfsError):
-                    st.commit(tx, "bad")
+            async def bad():
+                async with st.tx() as tx:
+                    await tx.put_bytes("/y.bin", os.urandom(2_200_000))
+                    parts = tx.intents[-1]["parts"]
+                    tx.w.drop([parts[1][0]])                                    # a piece vanishes before the manifest is written
+                    head = git(remote, "rev-parse", BRANCH) if git(remote, "branch", "--list") else ""
+                    with self.assertRaises(vfs.VfsError):
+                        await st.commit(tx, "bad")
+                return head
+            head = run(bad())
             if head:
                 self.assertEqual(git(remote, "rev-parse", BRANCH), head)
 
@@ -95,9 +103,9 @@ class AtomicUploadTests(unittest.TestCase):
             b = begin(a, [len(data)])
             put_chunks(a, b, "f0", data, 1_000_000, lambda o: o)
             self.assertTrue(staged(remote))
-            self.assertEqual(st.sweep_staging(set(), confirm=True), 0)          # first sighting: only remembered
+            self.assertEqual(run(st.sweep_staging(set(), confirm=True)), 0)          # first sighting: only remembered
             self.assertTrue(staged(remote))
-            self.assertGreater(st.sweep_staging(set(), confirm=True), 0)        # unchanged on the second pass: removed
+            self.assertGreater(run(st.sweep_staging(set(), confirm=True)), 0)        # unchanged on the second pass: removed
             self.assertEqual(staged(remote), [])
 
 

@@ -1,9 +1,10 @@
-"""Tiny GitHub REST client (read side) and git wrapper (write side).
+"""Async GitHub REST client (read side) and git wrapper (write side, blocking: runs in worker threads).
 
 Reads (ref, recursive tree with sizes, raw blobs) use the REST API: one conditional request (ETag, free
 when nothing changed) refreshes the whole listing. Writes use plain `git` so that a folder of 500 files
 is ONE push, not 500 API calls (GitHub rate-limits content creation to roughly 500 requests an hour).
 """
+import asyncio
 import base64
 import contextlib
 import os
@@ -11,12 +12,12 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 
-import requests
-import requests.adapters
+import anyio
+import httpx
+import orjson
 
-from . import config
+from . import aio, config
 
 API = "https://api.github.com"
 EMPTY_BLOB = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
@@ -56,12 +57,29 @@ def scrub(text):
 
 
 class Client:
+    """Async GitHub REST client (httpx). One pooled HTTP/1.1 client is shared by every request, so parallel
+    piece downloads reuse warm TLS connections instead of each paying for a handshake.
+
+    HTTP/2 is deliberately *not* used: multiplexing is no help for a few big downloads, and httpx's
+    pure-Python h2 stack with small flow-control windows is slower than plain HTTP/1.1 for large bodies.
+    """
+
     def __init__(self):
-        self.s = requests.Session()
-        # reuse connections: parallel piece downloads each used to wait for a fresh TLS handshake once the default pool of 10 was busy
-        adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32)
-        self.s.mount("https://", adapter)
+        self._http = None
         self._etags = {}
+
+    @property
+    def http(self):
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=60),
+                timeout=httpx.Timeout(60.0, connect=15.0), follow_redirects=True)
+        return self._http
+
+    async def aclose(self):
+        if self._http is not None:
+            http, self._http = self._http, None
+            await http.aclose()
 
     @property
     def owner_repo(self):
@@ -79,19 +97,28 @@ class Client:
         h.update(extra or {})
         return h
 
-    def request(self, method, path, retries=3, **kw):
+    @staticmethod
+    def _busy(r):
+        return r.status_code in (502, 503, 504) or (r.status_code in (403, 429) and r.headers.get("retry-after"))
+
+    @staticmethod
+    def _wait(r, attempt):
+        return min(30, float(r.headers.get("retry-after", 2 * (attempt + 1))))
+
+    async def request(self, method, path, retries=3, **kw):
         extra = kw.pop("headers", None)
+        timeout = kw.pop("timeout", 60)
         url = path if path.startswith("http") else API + path
         last = None
         for attempt in range(retries):
             try:
-                r = self.s.request(method, url, headers=self._headers(extra), timeout=kw.pop("timeout", 60), **kw)
-            except requests.RequestException as e:
+                r = await self.http.request(method, url, headers=self._headers(extra), timeout=timeout, **kw)
+            except httpx.HTTPError as e:
                 last = GitHubError(f"could not reach GitHub: {scrub(e)}")
-                time.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
-            if r.status_code in (502, 503, 504) or (r.status_code in (403, 429) and r.headers.get("retry-after")):
-                time.sleep(min(30, float(r.headers.get("retry-after", 2 * (attempt + 1)))))
+            if self._busy(r):
+                await asyncio.sleep(self._wait(r, attempt))
                 last = GitHubError(f"GitHub is busy ({r.status_code})", r.status_code)
                 continue
             return r
@@ -101,23 +128,25 @@ class Client:
         if r.status_code == 401:
             raise GitHubError("GitHub rejected the token (401). Check ARK_GITHUB_TOKEN.", 401)
         if r.status_code == 403:
-            msg = (r.json().get("message", "") if r.content else "")
+            msg = ""
+            with contextlib.suppress(ValueError):
+                msg = orjson.loads(r.content).get("message", "") if r.content else ""
             raise GitHubError(f"GitHub refused ({what}): {msg or 'forbidden; the token needs repo access'}", 403)
         if r.status_code >= 400:
             msg = ""
-            with contextlib.suppress(ValueError):
-                msg = r.json().get("message", "")
+            with contextlib.suppress(ValueError, AttributeError):
+                msg = orjson.loads(r.content).get("message", "")
             raise GitHubError(f"GitHub {what} failed ({r.status_code}): {msg}", r.status_code)
-        return r.json()
+        return orjson.loads(r.content)
 
-    def repo(self):
+    async def repo(self):
         o, n = self.owner_repo
-        return self._json(self.request("GET", f"/repos/{o}/{n}"), "repository lookup")
+        return self._json(await self.request("GET", f"/repos/{o}/{n}"), "repository lookup")
 
-    def tree(self, branch):
-        """Recursive listing of `branch` -> (commit/tree key, entries) or None if the branch is missing.
+    async def tree(self, branch):
+        """Recursive listing of `branch` -> (commit/tree key, entries, changed) or None if the branch is missing.
 
-        Returns (key, entries, changed). Uses ETag so an unchanged branch costs no rate limit.
+        Uses ETag so an unchanged branch costs no rate limit.
         """
         o, n = self.owner_repo
         path = f"/repos/{o}/{n}/git/trees/{branch}?recursive=1"
@@ -125,7 +154,7 @@ class Client:
         cached = self._etags.get(path)
         if cached:
             hdr["If-None-Match"] = cached[0]
-        r = self.request("GET", path, headers=hdr)
+        r = await self.request("GET", path, headers=hdr)
         if r.status_code == 304 and cached:
             return cached[1], cached[2], False
         if r.status_code in (404, 409):      # no such branch / empty repository
@@ -134,49 +163,75 @@ class Client:
         data = self._json(r, "listing")
         entries = data["tree"]
         if data.get("truncated"):
-            entries = self._walk(data["sha"])
+            entries = await self._walk(data["sha"])
         key = data["sha"]
         self._etags[path] = (r.headers.get("ETag", ""), key, entries)
         return key, entries, True
 
-    def _walk(self, sha, prefix=""):
+    async def _walk(self, sha, prefix=""):
         o, n = self.owner_repo
-        data = self._json(self.request("GET", f"/repos/{o}/{n}/git/trees/{sha}"), "listing")
-        out = []
+        data = self._json(await self.request("GET", f"/repos/{o}/{n}/git/trees/{sha}"), "listing")
+        out, subs = [], []
         for e in data["tree"]:
             e = dict(e, path=prefix + e["path"])
             out.append(e)
             if e["type"] == "tree":
-                out.extend(self._walk(e["sha"], e["path"] + "/"))
+                subs.append(e)
+        # sub-trees are independent: list them all at once instead of one after the other
+        for sub in await asyncio.gather(*(self._walk(e["sha"], e["path"] + "/") for e in subs)):
+            out.extend(sub)
         return out
 
-    def head(self, branch):
+    async def head(self, branch):
         o, n = self.owner_repo
-        r = self.request("GET", f"/repos/{o}/{n}/git/ref/heads/{branch}")
+        r = await self.request("GET", f"/repos/{o}/{n}/git/ref/heads/{branch}")
         if r.status_code in (404, 409):
             return None
         return self._json(r, "branch lookup")["object"]["sha"]
 
-    def download_blob(self, sha, dest, progress=None):
-        """Stream a raw blob (<= 100 MB) to `dest`."""
+    async def download_blob(self, sha, dest, progress=None):
+        """Stream a raw blob (<= 100 MB) to `dest` without ever holding it in memory."""
         o, n = self.owner_repo
-        r = self.request("GET", f"/repos/{o}/{n}/git/blobs/{sha}", stream=True, timeout=300,
-                         headers={"Accept": "application/vnd.github.raw+json"})
-        if r.status_code >= 400:
-            self._json(r, "download")
+        url = f"{API}/repos/{o}/{n}/git/blobs/{sha}"
         tmp = f"{dest}.part{os.getpid()}"
+        last = None
         try:
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_content(1 << 20):
-                    f.write(chunk)
-            os.replace(tmp, dest)
+            for attempt in range(3):
+                try:
+                    req = self.http.build_request("GET", url, headers=self._headers({"Accept": "application/vnd.github.raw+json"}),
+                                                  timeout=httpx.Timeout(60.0, connect=15.0, read=300.0))
+                    r = await self.http.send(req, stream=True)
+                    try:
+                        if self._busy(r):
+                            await r.aread()
+                            last = GitHubError(f"GitHub is busy ({r.status_code})", r.status_code)
+                            await asyncio.sleep(self._wait(r, attempt))
+                            continue
+                        if r.status_code >= 400:
+                            await r.aread()
+                            self._json(r, "download")
+                        done = 0
+                        async with await anyio.open_file(tmp, "wb") as f:
+                            async for chunk in r.aiter_bytes(1 << 20):
+                                await f.write(chunk)
+                                done += len(chunk)
+                                if progress:
+                                    progress(done)
+                    finally:
+                        await r.aclose()
+                    await aio.run(os.replace, tmp, dest)
+                    return
+                except httpx.HTTPError as e:
+                    last = GitHubError(f"could not reach GitHub: {scrub(e)}")
+                    await asyncio.sleep(1.5 * (attempt + 1))
+            raise last or GitHubError("GitHub download failed")
         finally:
             with contextlib.suppress(OSError):
                 os.remove(tmp)
 
-    def delete_branch(self, branch):
+    async def delete_branch(self, branch):
         o, n = self.owner_repo
-        r = self.request("DELETE", f"/repos/{o}/{n}/git/refs/heads/{branch}")
+        r = await self.request("DELETE", f"/repos/{o}/{n}/git/refs/heads/{branch}")
         if r.status_code not in (204, 404, 422):
             self._json(r, "delete branch")
 

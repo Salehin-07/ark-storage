@@ -4,8 +4,8 @@ import subprocess
 import threading
 import unittest
 
-from tests.helpers import sandbox
-from tests.test_api import Api
+from tests.helpers import ApiCase, sandbox
+from tests.api_harness import Api
 
 
 def git(remote, *a):
@@ -29,7 +29,7 @@ def commit(a, b, names, policy="rename"):
     return a.job(r)
 
 
-class StreamingTests(unittest.TestCase):
+class StreamingTests(ApiCase):
     def setUp(self):
         # record whether the final push had to lazily fetch freed blobs back (a pack appearing in the work dir)
         from arkstorage import gh
@@ -61,7 +61,7 @@ class StreamingTests(unittest.TestCase):
                 return sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs)
             held = sum(disk(os.path.join(st.cache.dir.parent, n)) for n in os.listdir(st.cache.dir.parent) if n.startswith("ark-obj-"))
             self.assertLess(held, 4_500_000, "pushed pieces must be freed locally (7.8 MB uploaded)")
-            self.assertGreater(len(st.refresh(force=True).entries) and git(remote, "log", "--oneline", "refs/heads/ark-data").count("staging upload"), 0)
+            self.assertGreater(a.st.idx.entries and git(remote, "log", "--oneline", "refs/heads/ark-data").count("staging upload"), 0)
             commit(a, b, ["big.bin", "small.bin", "empty.bin"])
             self.assertEqual(self.refetched, [], "freed pieces must never be downloaded again")
             self.assertEqual(a.call("get", "/api/raw?path=/big.bin").data, big)
@@ -105,7 +105,6 @@ class StreamingTests(unittest.TestCase):
             # an upload abandoned by a restart: staging data of an unknown batch is swept on the next begin
             b2 = begin(a, [len(data)])
             put_chunks(a, b2, "f0", data, 1_000_000, lambda o: o)
-            a.app.view_functions  # noqa: B018
             a2 = Api(st, remote)           # fresh app instance = server restart (no live uploads)
             a2.login()
             begin(a2, [10])

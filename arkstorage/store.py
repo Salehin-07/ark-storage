@@ -1,4 +1,10 @@
-"""The storage engine: reads through the GitHub API + a disk cache, writes as git commits."""
+"""The storage engine (async): reads through the GitHub API + a disk cache, writes as git commits.
+
+Everything that waits on the network or the disk is a coroutine, so one event loop serves any number of
+simultaneous downloads and uploads. Work that is inherently blocking -- the ``git`` subprocesses, hashing,
+AES, walking big trees -- runs in worker threads through ``aio.run`` and never stalls the loop.
+"""
+import asyncio
 import base64
 import contextlib
 import io
@@ -9,62 +15,92 @@ import secrets
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-from . import config, crypto, vfs
+import anyio
+
+from . import aio, config, crypto, vfs
 from .gh import EMPTY_BLOB, Client, Git, GitHubError, NonFastForward
 from .vfs import FILES, META, CONF, TRASH, TRASH_META, SUF_PARTS, VfsError
 
 STAGE = ".ark/staging/"      # pieces pushed early while an upload is still arriving; removed by its final commit
+AHEAD = 3                    # pieces fetched ahead of the one being read
+WINDOW = 2 << 20             # plaintext decrypted per step when streaming an encrypted file (a multiple of the segment size)
 
 README = (b"# Ark Storage data\n\nThis branch is managed by [Ark Storage](https://github.com/Salehin-07/ark-storage).\n"
           b"Your files live under `files/` (large files are split into `*.arkparts/` pieces, encrypted ones end in "
           b"`.arkenc`). Edit them through the app, not by hand.\n")
 
+log = logging.getLogger("ark")
+
 
 class Cache:
-    """Blobs downloaded from GitHub, kept on disk (LRU) so repeated views are instant."""
+    """Blobs downloaded from GitHub, kept on disk (LRU) so repeated views are instant.
+
+    A download is an independent task that any number of readers can wait on: a second request for the same
+    piece joins the running download instead of starting another, and a reader that goes away (tab closed,
+    video seek) does not abort it, so the piece still lands in the cache for the next request.
+    """
 
     def __init__(self, client):
         self.client = client
         self.dir = config.DATA_DIR / "cache"
-        self._locks = {}
-        self._glock = threading.Lock()
+        self._inflight = {}              # sha -> asyncio.Task
+        self._sem = asyncio.Semaphore(8)  # at most this many GitHub downloads at once
         self._total = None               # running size of the cache; None = not measured yet
 
     def path(self, sha):
         return self.dir / sha[:2] / sha
 
-    def ensure(self, sha):
+    def _start(self, sha):
+        task = asyncio.get_running_loop().create_task(self._download(sha), name=f"fetch-{sha[:8]}")
+        self._inflight[sha] = task
+
+        def done(t, sha=sha):
+            self._inflight.pop(sha, None)
+            if not t.cancelled():
+                t.exception()            # mark as retrieved: a prefetch nobody waits for must not log noise
+        task.add_done_callback(done)
+        return task
+
+    def warm(self, sha):
+        """Start fetching `sha` in the background (no-op when it is cached or already on its way)."""
+        if sha not in self._inflight and not self.path(sha).exists():
+            self._start(sha)
+
+    async def ensure(self, sha):
         p = self.path(sha)
         if p.exists():
             with contextlib.suppress(OSError):
                 os.utime(p)
             return p
-        with self._glock:
-            lock = self._locks.setdefault(sha, threading.Lock())
-        with lock:
-            if not p.exists():
-                p.parent.mkdir(parents=True, exist_ok=True)
-                self.client.download_blob(sha, str(p))
-                self._added(p, sha)
+        task = self._inflight.get(sha) or self._start(sha)
+        await asyncio.shield(task)
         return p
 
-    def _added(self, p, sha):
-        """Count a new blob and only walk the cache directory when it may be over the limit
-        (it used to be walked, every file stat'ed, after every single download)."""
+    async def _download(self, sha):
+        p = self.path(sha)
+        async with self._sem:
+            if p.exists():
+                return
+            p.parent.mkdir(parents=True, exist_ok=True)
+            await self.client.download_blob(sha, str(p))
+        await self._added(p)
+
+    async def _added(self, p):
+        """Count a new blob and only walk the cache directory when it may be over the limit."""
         try:
             size = p.stat().st_size
         except OSError:
             return
-        with self._glock:
-            if self._total is None:
-                self._total = None if not self.dir.exists() else sum(e[1] for e in self.entries())
-            else:
-                self._total += size
-            over = self._total is not None and self._total > config.get("cache_mb") * 1024 * 1024
-        if over:
-            self.evict(keep=sha)
+        if self._total is None:
+            self._total = await aio.run(self._measure)
+        else:
+            self._total += size
+        if self._total > config.get("cache_mb") * 1024 * 1024:
+            await aio.run(self.evict, p.name)
+
+    def _measure(self):
+        return sum(e[1] for e in self.entries()) if self.dir.exists() else 0
 
     def entries(self):
         out = []
@@ -101,49 +137,80 @@ class Cache:
 
 
 class Reader:
-    """Random access to the *plain* bytes of a stored file (joins pieces, decrypts)."""
+    """Random access to the *plain* bytes of a stored file (joins pieces, decrypts), as an async stream.
+
+    Pieces are fetched on demand (and a few ahead); the bytes themselves are read from the disk cache with
+    ``pread`` in worker threads, so a slow disk or a big decrypt never blocks other requests.
+    """
 
     def __init__(self, store, node, idx):
         self.store, self.node, self.idx = store, node, idx
         self.size = node.size
         self.parts = node.parts
         self.stored = node.stored_size
-        self._open = {}
+        self._fds = {}
+
+    # -- piece management ------------------------------------------------------------------------
+    def _covering(self, a, b):
+        """Indexes of the pieces that overlap stored bytes [a, b)."""
+        out, pos = [], 0
+        for k, (_p, _sha, sz) in enumerate(self.parts):
+            if pos >= b:
+                break
+            if sz and a < pos + sz:
+                out.append(k)
+            pos += sz
+        return out
+
+    async def _ensure(self, a, b):
+        ks = self._covering(a, b)
+        if ks:
+            self.store.prefetch([p[1] for p in self.parts[ks[0] + 1:ks[0] + 1 + AHEAD]])
+        for k in ks:
+            await self.store.cache.ensure(self.parts[k][1])
+
+    def _fd(self, sha):
+        fd = self._fds.get(sha)
+        if fd is None:
+            fd = self._fds[sha] = os.open(self.store.cache.path(sha), os.O_RDONLY)
+        return fd
 
     def _read_stored(self, off, n):
-        out = []
-        pos = 0
-        for k, (_path, sha, sz) in enumerate(self.parts):
-            if off < pos + sz and n > 0:
-                f = self._open.get(sha)
-                if f is None:
-                    self.store.prefetch([p[1] for p in self.parts[k + 1:k + 4]])
-                    f = self._open[sha] = open(self.store.cache.ensure(sha), "rb")
-                f.seek(off - pos)
-                chunk = f.read(min(n, pos + sz - off))
-                if not chunk:
-                    raise VfsError("A stored piece is shorter than expected; clear the cache in Settings and retry", 502)
-                out.append(chunk)
-                off += len(chunk)
-                n -= len(chunk)
-            pos += sz
+        """Blocking read of stored bytes [off, off+n) from already-cached pieces (runs in a worker thread)."""
+        out, pos = [], 0
+        for (_path, sha, sz) in self.parts:
             if n <= 0:
                 break
+            if off < pos + sz:
+                want, rel, got = min(n, pos + sz - off), off - pos, []
+                fd = self._fd(sha)
+                while want > 0:
+                    chunk = os.pread(fd, want, rel)
+                    if not chunk:
+                        raise VfsError("A stored piece is shorter than expected; clear the cache in Settings and retry", 502)
+                    got.append(chunk)
+                    want -= len(chunk)
+                    rel += len(chunk)
+                data = b"".join(got)
+                out.append(data)
+                off += len(data)
+                n -= len(data)
+            pos += sz
         return b"".join(out)
 
-    def iter(self, start=0, end=None, block=1 << 18):
+    # -- streaming -------------------------------------------------------------------------------
+    async def iter(self, start=0, end=None, block=1 << 20):
         end = self.size if end is None else min(end, self.size)
         try:
             if self.node.enc:
-                master = self.store.master(self.idx)
-                try:
-                    yield from crypto.decrypt_range(master, self._read_stored, self.stored, start, end)
-                except crypto.CryptoError as e:
-                    raise VfsError(str(e), 423) from None
+                async for chunk in self._iter_encrypted(start, end):
+                    yield chunk
             else:
                 pos = start
                 while pos < end:
-                    chunk = self._read_stored(pos, min(block, end - pos))
+                    n = min(block, end - pos)
+                    await self._ensure(pos, pos + n)
+                    chunk = await aio.run(self._read_stored, pos, n)
                     if not chunk:
                         break
                     yield chunk
@@ -151,15 +218,37 @@ class Reader:
         finally:
             self.close()
 
-    def read_all(self, limit=None):
+    async def _iter_encrypted(self, start, end):
+        master = await self.store.master(self.idx)
+        try:
+            total = crypto.plain_size(self.stored)
+            end = min(end, total)
+            if start >= end:                                   # still authenticate an empty file
+                for a, b in crypto.stored_span(self.stored, 0, 0):
+                    await self._ensure(a, b)
+                await aio.run(lambda: list(crypto.decrypt_range(master, self._read_stored, self.stored, 0, 0)))
+                return
+            pos = start
+            while pos < end:
+                nxt = min(end, (pos // WINDOW + 1) * WINDOW)
+                for a, b in crypto.stored_span(self.stored, pos, nxt):
+                    await self._ensure(a, b)
+                data = await aio.run(lambda p=pos, q=nxt: b"".join(crypto.decrypt_range(master, self._read_stored, self.stored, p, q)))
+                yield data
+                pos = nxt
+        except crypto.CryptoError as e:
+            raise VfsError(str(e), 423) from None
+
+    async def read_all(self, limit=None):
         if limit is not None and self.size > limit:
             raise VfsError("File is too large for this action", 413)
-        return b"".join(self.iter())
+        return b"".join([c async for c in self.iter()])
 
     def close(self):
-        for f in self._open.values():
-            f.close()
-        self._open.clear()
+        for fd in self._fds.values():
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self._fds.clear()
 
 
 class Stager:
@@ -249,16 +338,25 @@ class Ingest:
     def __init__(self, store, bid):
         self.store, self.bid = store, bid
         self.enc = store.encrypt_enabled()
-        self.master = store.master_for_write() if self.enc else None
+        self.master = None
         self.chunk = config.get("chunk_mb") * 1024 * 1024
         self.limit = config.get("stage_mb") * 1024 * 1024
-        self._cm = store.git.work()
-        self.w = self._cm.__enter__()
-        self._lock = threading.Lock()
-        self._flush = threading.Lock()
+        self._cm = None
+        self.w = None
+        self._lock = threading.Lock()          # Stager callbacks come from worker threads
+        self._flush = asyncio.Lock()
         self.pending, self.pend_bytes, self.staged = [], 0, set()
         self.last_error = ""
         self.t = time.time()
+
+    @classmethod
+    async def create(cls, store, bid):
+        ing = cls(store, bid)
+        if ing.enc:
+            ing.master = await store.master_for_write()
+        ing._cm = store.git.work()
+        ing.w = await aio.run(ing._cm.__enter__)
+        return ing
 
     def stager(self, tag):
         return Stager(self.w, self.enc, self.master, self.chunk, tag, self._piece)
@@ -268,45 +366,41 @@ class Ingest:
             self.pending.append(sha)
             self.pend_bytes += n
 
-    def maybe_flush(self):
-        """Call outside any lock after feeding data. Pushes a batch once enough has piled up; if the
-        client outruns GitHub (2x the batch size waiting) the caller blocks, which throttles the upload."""
+    async def maybe_flush(self):
+        """Pushes a batch once enough has piled up; if the client outruns GitHub (2x the batch size waiting)
+        the caller waits for the push, which throttles the upload."""
         if self.pend_bytes >= self.limit:
-            self.flush(block=self.pend_bytes >= 2 * self.limit)
+            await self.flush(block=self.pend_bytes >= 2 * self.limit)
 
-    def flush(self, block=False):
-        if not self._flush.acquire(blocking=block):      # another thread is already pushing
+    async def flush(self, block=False):
+        if self._flush.locked() and not block:      # another push is already running
             return
-        try:
+        async with self._flush:
             with self._lock:
                 batch, self.pending, self.pend_bytes = self.pending, [], 0
             shas = [x for x in dict.fromkeys(batch) if x not in self.staged]
             if not shas:
                 return
             try:
-                self.store._stage_push(self, shas)
-            except Exception as e:                      # not fatal: the final commit pushes what is left locally
+                await self.store._stage_push(self, shas)
+            except Exception as e:                  # noqa: BLE001 - not fatal: the final commit pushes what is left locally
                 self.last_error = str(e)
-                logging.getLogger("ark").warning("staging push failed (will retry later): %s", e)
+                log.warning("staging push failed (will retry later): %s", e)
                 with self._lock:
                     self.pending = shas + self.pending
-        finally:
-            self._flush.release()
 
-    def abort(self):
-        try:
-            self.store.drop_staging(self)
-        except Exception:
-            pass
+    async def abort(self):
+        with contextlib.suppress(Exception):
+            await self.store.drop_staging(self)
 
-    def close(self):
+    async def close(self):
         if self._cm:
             cm, self._cm = self._cm, None
-            cm.__exit__(None, None, None)
+            await aio.run(cm.__exit__, None, None, None)
 
 
 class Tx:
-    """A batch of changes that becomes ONE commit. Use via ``with store.tx() as tx``."""
+    """A batch of changes that becomes ONE commit. Use via ``async with store.tx() as tx``."""
 
     def __init__(self, store, ingest=None):
         self.store = store
@@ -317,18 +411,18 @@ class Tx:
         self._cm = None
         self.w = None
 
-    def __enter__(self):
+    async def __aenter__(self):
         if self.ingest:
             self.w = self.ingest.w
             return self
         self._cm = self.store.git.work()
-        self.w = self._cm.__enter__()
+        self.w = await aio.run(self._cm.__enter__)
         return self
 
-    def __exit__(self, *exc):
+    async def __aexit__(self, *exc):
         if self.ingest:
             return False
-        return self._cm.__exit__(*exc)
+        return await aio.run(self._cm.__exit__, *exc)
 
     def put_staged(self, vpath, parts, enc, mtime=None, policy="replace", expect=None):
         """Register a file whose pieces an Ingest already hashed (and maybe pushed). `expect` is the plain size the
@@ -339,12 +433,10 @@ class Tx:
                                  mtime=int(mtime if mtime is not None else time.time())))
 
     # -- staging ---------------------------------------------------------------------------------
-    def put(self, vpath, src, mtime=None, policy="replace", enc=None):
-        """Stage a file. `src` is a path or a file object."""
+    def put_blocking(self, vpath, src, mtime=None, policy="replace", enc=False, master=None):
+        """Stage a file (blocking: call from a worker thread). `src` is a path or a file object."""
         vpath = vfs.norm(vpath)
         vfs.validate_name(vfs.basename(vpath))
-        enc = self.store.encrypt_enabled() if enc is None else enc
-        master = self.store.master_for_write() if enc else None
         chunk = config.get("chunk_mb") * 1024 * 1024
         if isinstance(src, (str, os.PathLike)):
             with open(src, "rb") as f:
@@ -354,8 +446,13 @@ class Tx:
         self.intents.append(dict(op="put", path=vpath, parts=parts, enc=enc, policy=policy,
                                  mtime=int(mtime if mtime is not None else time.time())))
 
-    def put_bytes(self, vpath, data, **kw):
-        self.put(vpath, io.BytesIO(data), **kw)
+    async def put(self, vpath, src, mtime=None, policy="replace", enc=None):
+        enc = self.store.encrypt_enabled() if enc is None else enc
+        master = await self.store.master_for_write() if enc else None
+        await aio.run(self.put_blocking, vpath, src, mtime, policy, enc, master)
+
+    async def put_bytes(self, vpath, data, **kw):
+        await self.put(vpath, io.BytesIO(data), **kw)
 
     def mkdir(self, vpath):
         vpath = vfs.norm(vpath)
@@ -386,24 +483,26 @@ class Store:
         self.cache = Cache(self.client)
         self.idx = None
         self._checked = 0
-        self._rlock = threading.RLock()
-        self._wlock = threading.RLock()
+        self._rlock = asyncio.Lock()     # one listing refresh at a time
+        self._wlock = asyncio.Lock()     # one commit/push at a time
+        self._mlock = asyncio.Lock()     # one scrypt derivation at a time
+        self._ilock = asyncio.Lock()     # one branch initialisation at a time (never the write lock: refresh runs inside commits)
+        self._bg = None                  # background revalidation task
         self._json_cache = {}
         self._stale = {}                 # staging batches seen abandoned on the last cleanup pass: {batch: frozenset(paths)}
         self._master = None
         self.private = None
         self.last_error = ""
-        self._pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ark-prefetch")
+
+    async def aclose(self):
+        if self._bg and not self._bg.done():
+            self._bg.cancel()
+        await self.client.aclose()
 
     def prefetch(self, shas):
         """Warm the disk cache with the next pieces of a file being read (hides GitHub latency)."""
         for sha in shas:
-            if not self.cache.path(sha).exists():
-                self._pool.submit(self._warm, sha)
-
-    def _warm(self, sha):
-        with contextlib.suppress(Exception):
-            self.cache.ensure(sha)
+            self.cache.warm(sha)
 
     # -- configuration -------------------------------------------------------------------------
     def problems(self):
@@ -416,18 +515,17 @@ class Store:
 
     def reset(self):
         """Forget cached state after settings changed."""
-        with self._rlock:
-            self.idx = None
-            self._checked = 0
-            self._master = None
-            self.private = None
-            self.client._etags.clear()
+        self.idx = None
+        self._checked = 0
+        self._master = None
+        self.private = None
+        self.client._etags.clear()
 
     def encrypt_enabled(self):
         return bool(config.get("encrypt"))
 
     # -- encryption ----------------------------------------------------------------------------
-    def master(self, idx=None):
+    async def master(self, idx=None):
         idx = idx or self.idx
         phrase = config.get("passphrase")
         if not phrase:
@@ -435,41 +533,51 @@ class Store:
         conf = idx.conf if idx else {}
         if not conf.get("salt"):
             raise VfsError("Encryption has not been initialised in this repository yet.", 423)
-        salt = base64.b64decode(conf["salt"])
         if self._master and self._master[0] == (phrase, conf["salt"]):
             return self._master[1]
-        key = crypto.derive_master(phrase, salt)
-        try:
-            ok = crypto.decrypt_bytes(key, base64.b64decode(conf["check"])) == b"ark-storage"
-        except crypto.CryptoError:
-            ok = False
-        if not ok:
-            raise VfsError("Wrong passphrase.", 423)
-        self._master = ((phrase, conf["salt"]), key)
-        return key
+        async with self._mlock:
+            if self._master and self._master[0] == (phrase, conf["salt"]):
+                return self._master[1]
+            salt = base64.b64decode(conf["salt"])
 
-    def master_for_write(self):
+            def derive():
+                key = crypto.derive_master(phrase, salt)
+                try:
+                    ok = crypto.decrypt_bytes(key, base64.b64decode(conf["check"])) == b"ark-storage"
+                except crypto.CryptoError:
+                    ok = False
+                return key, ok
+            key, ok = await aio.run(derive)
+            if not ok:
+                raise VfsError("Wrong passphrase.", 423)
+            self._master = ((phrase, conf["salt"]), key)
+            return key
+
+    async def master_for_write(self):
         if not config.get("passphrase"):
             raise VfsError("Encryption is on but no passphrase is set. Set one in Settings -> Encryption.", 423)
-        idx = self.refresh()
+        idx = await self.refresh()
         if not idx.conf.get("salt"):
-            self.init_crypto()
-            idx = self.refresh(force=True)
-        return self.master(idx)
+            await self.init_crypto()
+            idx = await self.refresh(force=True)
+        return await self.master(idx)
 
-    def init_crypto(self):
+    async def init_crypto(self):
         phrase = config.get("passphrase")
-        with self._wlock:
-            idx = self.refresh(force=True)
+        async with self._wlock:
+            idx = await self.refresh(force=True)
             if idx.conf.get("salt"):
                 return
             salt = os.urandom(16)
-            key = crypto.derive_master(phrase, salt)
-            conf = {"v": 1, "salt": base64.b64encode(salt).decode(),
-                    "check": base64.b64encode(crypto.encrypt_bytes(key, b"ark-storage")).decode()}
-            with self.tx() as tx:
+
+            def make():
+                key = crypto.derive_master(phrase, salt)
+                return {"v": 1, "salt": base64.b64encode(salt).decode(),
+                        "check": base64.b64encode(crypto.encrypt_bytes(key, b"ark-storage")).decode()}
+            conf = await aio.run(make)
+            async with self.tx() as tx:
                 tx.set_conf(conf)
-                self._commit_locked(tx, "Initialise encryption")
+                await self._commit_locked(tx, "Initialise encryption")
 
     def crypto_state(self):
         idx = self.idx
@@ -477,59 +585,103 @@ class Store:
                 "initialised": bool(idx and idx.conf.get("salt"))}
 
     # -- reading the repository ----------------------------------------------------------------
-    def refresh(self, force=False):
-        with self._rlock:
-            now = time.time()
-            if not force and self.idx and now - self._checked < config.get("refresh_seconds"):
+    async def refresh(self, force=False):
+        """The current listing. Fresh for ``refresh_seconds``; after that a still-recent listing is returned at once
+        while a background task revalidates it (one cheap conditional request), so no request ever pays for the check.
+        Anything older than three times that, or ``force``, waits for the real answer."""
+        if not force and self.idx:
+            age, ttl = time.time() - self._checked, config.get("refresh_seconds")
+            if age < ttl:
                 return self.idx
-            probs = self.problems()
-            if probs:
-                raise VfsError(probs[0], 503)
-            branch = config.get("branch")
-            try:
-                res = self.client.tree(branch)
-                if res is None:
-                    self._init_branch(branch)
-                    res = self.client.tree(branch)
-                    if res is None:
-                        raise GitHubError("The storage branch was created but cannot be read yet; try again.")
-            except GitHubError as e:
-                self.last_error = str(e)
-                raise VfsError(str(e), 502 if not e.status or e.status >= 500 else 503) from None
-            self.last_error = ""
-            key, entries, changed = res
-            if self.idx is None or changed or self.idx.key != key:
-                by = {e["path"]: e for e in entries}
-                meta = self._load_json(by.get(META))
-                conf = self._load_json(by.get(CONF))
-                tm = self._load_json(by.get(TRASH_META))
-                self.idx = vfs.Index(key, entries, meta, conf, tm)
-            self._checked = now
-            return self.idx
+            if age < ttl * 3 and not self.problems():
+                if self._bg is None or self._bg.done():
+                    self._bg = asyncio.get_running_loop().create_task(self._revalidate(), name="ark-revalidate")
+                return self.idx
+        return await self._refresh_now(force)
 
-    def _load_json(self, entry):
+    async def _revalidate(self):
+        try:
+            await self._refresh_now(True)
+        except Exception as e:                       # noqa: BLE001 - the next request that has to wait will report it
+            log.debug("background refresh failed: %s", e)
+
+    def _fail(self, e):
+        self.last_error = str(e)
+        return VfsError(str(e), 502 if not e.status or e.status >= 500 else 503)
+
+    async def _refresh_now(self, force):
+        branch = config.get("branch")
+        for attempt in range(2):
+            async with self._rlock:
+                now = time.time()
+                if not force and self.idx and now - self._checked < config.get("refresh_seconds"):
+                    return self.idx
+                probs = self.problems()
+                if probs:
+                    raise VfsError(probs[0], 503)
+                try:
+                    res = await self.client.tree(branch)
+                    if res is None and attempt:
+                        raise GitHubError("The storage branch was created but cannot be read yet; try again.")
+                except GitHubError as e:
+                    raise self._fail(e) from None
+                if res is not None:
+                    self.last_error = ""
+                    key, entries, changed = res
+                    if self.idx is None or changed or self.idx.key != key:
+                        self.idx = await self._build_index(key, entries)
+                    self._checked = now
+                    return self.idx
+            try:
+                await self._init_branch(branch)
+            except GitHubError as e:
+                raise self._fail(e) from None
+        raise VfsError("The storage branch could not be read.", 502)
+
+    async def _build_index(self, key, entries):
+        def find():
+            want, found = {META, CONF, TRASH_META}, {}
+            for e in entries:
+                if e["path"] in want:
+                    found[e["path"]] = e
+            return found
+        by = await aio.run(find)
+        meta = await self._load_json(by.get(META))
+        conf = await self._load_json(by.get(CONF))
+        tm = await self._load_json(by.get(TRASH_META))
+        return await aio.run(vfs.Index, key, entries, meta, conf, tm)
+
+    async def _load_json(self, entry):
         if not entry:
             return {}
         sha = entry["sha"]
         if sha not in self._json_cache:
-            try:
-                self._json_cache[sha] = json.loads(self.cache.ensure(sha).read_text("utf-8") or "{}")
-            except ValueError:
-                self._json_cache[sha] = {}
+            p = await self.cache.ensure(sha)
+
+            def parse():
+                try:
+                    return json.loads(p.read_text("utf-8") or "{}")
+                except ValueError:
+                    return {}
+            self._json_cache[sha] = await aio.run(parse)
             if len(self._json_cache) > 50:
                 self._json_cache.pop(next(iter(self._json_cache)))
         return self._json_cache[sha]
 
-    def _init_branch(self, branch):
-        with self._wlock:
-            if self.git.fetch(branch):
+    async def _init_branch(self, branch):
+        async with self._ilock:
+            if await aio.run(self.git.fetch, branch):
                 return
-            with self.git.work() as w:
-                sha = w.hash_bytes(README)
-                w.commit(None, [("README.md", "100644", sha)], "Initialize Ark Storage", branch)
 
-    def repo_info(self):
-        info = self.client.repo()
+            def make():
+                with self.git.work() as w:
+                    sha = w.hash_bytes(README)
+                    w.commit(None, [("README.md", "100644", sha)], "Initialize Ark Storage", branch)
+            with contextlib.suppress(NonFastForward):     # someone else created the branch first: fine
+                await aio.run(make)
+
+    async def repo_info(self):
+        info = await self.client.repo()
         self.private = info.get("private")
         return info
 
@@ -537,7 +689,8 @@ class Store:
         return Reader(self, node, idx or self.idx)
 
     def stats(self):
-        idx = self.refresh()
+        """Counts over the whole listing (CPU work on big repositories: call through ``aio.run``)."""
+        idx = self.idx
         files = [n for n in idx.files.nodes.values() if not n.is_dir]
         return {"files": len(files), "folders": sum(1 for n in idx.files.nodes.values() if n.is_dir) - 1,
                 "bytes": sum(n.size for n in files), "stored_bytes": sum(n.stored_size for n in files),
@@ -547,54 +700,58 @@ class Store:
     def tx(self, ingest=None):
         return Tx(self, ingest)
 
-    def _stage_push(self, ing, shas):
+    async def _stage_push(self, ing, shas):
         """Push already-hashed pieces now (hidden commit) and free them locally."""
         branch = config.get("branch")
         ops = [(f"{STAGE}{ing.bid}/{x}", "100644", x) for x in shas]
-        with self._wlock:
+        async with self._wlock:
             for _ in range(4):
-                self.refresh()
-                parent = self.git.fetch(branch)
+                await self.refresh()
+                parent = await aio.run(self.git.fetch, branch)
                 try:
-                    ing.w.commit(parent, ops, f"Ark: staging upload {ing.bid}", branch)
+                    await aio.run(ing.w.commit, parent, ops, f"Ark: staging upload {ing.bid}", branch)
                     break
                 except NonFastForward:
-                    time.sleep(1)
+                    await asyncio.sleep(1)
             else:
                 raise VfsError("Could not stage upload data (the branch kept moving)", 409)
         ing.staged.update(shas)
-        ing.w.drop(shas)
+        await aio.run(ing.w.drop, shas)
 
-    def drop_staging(self, ing):
+    async def drop_staging(self, ing):
         if not ing.staged:
             return
         branch = config.get("branch")
         ops = [(f"{STAGE}{ing.bid}/{x}", None, None) for x in sorted(ing.staged)]
-        with self._wlock:
+        async with self._wlock:
             for _ in range(3):
-                parent = self.git.fetch(branch)
+                parent = await aio.run(self.git.fetch, branch)
                 if not parent:
                     break
                 try:
-                    ing.w.commit(parent, ops, "Ark: discard unfinished upload", branch)
+                    await aio.run(ing.w.commit, parent, ops, "Ark: discard unfinished upload", branch)
                     break
                 except NonFastForward:
-                    time.sleep(1)
+                    await asyncio.sleep(1)
         ing.staged.clear()
 
-    def sweep_staging(self, live, confirm=False):
+    async def sweep_staging(self, live, confirm=False):
         """Remove the pieces of uploads that never made it into a manifest (server restarted, tab closed...).
 
         With ``confirm`` a batch is only removed when it was already seen abandoned, unchanged, on the previous pass:
         an upload that is still arriving (even in another worker process) keeps adding pieces, so it is never mistaken
         for an abandoned one. Returns how many pieces were removed."""
-        idx = self.refresh(force=True)
-        groups = {}
-        for p, e in idx.entries.items():
-            if p.startswith(STAGE) and e["type"] == "blob":
-                bid = p[len(STAGE):].split("/")[0]
-                if bid not in live:
-                    groups.setdefault(bid, []).append(p)
+        idx = await self.refresh(force=True)
+
+        def group():
+            groups = {}
+            for p, e in idx.entries.items():
+                if p.startswith(STAGE) and e["type"] == "blob":
+                    bid = p[len(STAGE):].split("/")[0]
+                    if bid not in live:
+                        groups.setdefault(bid, []).append(p)
+            return groups
+        groups = await aio.run(group)
         seen, self._stale = self._stale, {}
         stale = []
         for bid, paths in groups.items():
@@ -606,20 +763,24 @@ class Store:
         if not stale:
             return 0
         branch = config.get("branch")
-        with self._wlock, self.git.work() as w:
+
+        def push(parent):
+            with self.git.work() as w:
+                w.commit(parent, [(p, None, None) for p in stale], "Ark: remove abandoned upload data", branch)
+        async with self._wlock:
             for _ in range(3):
-                parent = self.git.fetch(branch)
+                parent = await aio.run(self.git.fetch, branch)
                 try:
-                    w.commit(parent, [(p, None, None) for p in stale], "Ark: remove abandoned upload data", branch)
+                    await aio.run(push, parent)
                     break
                 except NonFastForward:
-                    time.sleep(1)
-        self.refresh(force=True)
+                    await asyncio.sleep(1)
+        await self.refresh(force=True)
         return len(stale)
 
-    def commit(self, tx, message):
-        with self._wlock:
-            return self._commit_locked(tx, message)
+    async def commit(self, tx, message):
+        async with self._wlock:
+            return await self._commit_locked(tx, message)
 
     def _piece_ok(self, tx, idx, sha, size):
         """Is this piece really there, with the size we hashed? On GitHub (staged) or in the local object store."""
@@ -653,27 +814,27 @@ class Store:
                     raise VfsError(f"'{name}' was not saved: its pieces don't add up to the size that was announced "
                                    "(the upload was cut short), so nothing was changed.", 409)
 
-    def _commit_locked(self, tx, message):
+    async def _commit_locked(self, tx, message):
         branch = config.get("branch")
         last = None
         for _attempt in range(4):
-            idx = self.refresh(force=True)
-            self._verify_puts(tx, idx)
-            ops, results = self._apply(tx, idx)
+            idx = await self.refresh(force=True)
+            await aio.run(self._verify_puts, tx, idx)
+            ops, results = await aio.run(self._apply, tx, idx)
             if tx.ingest and tx.ingest.staged:       # the files now exist for real: drop their staging entries
                 ops = ops + [(f"{STAGE}{tx.ingest.bid}/{x}", None, None) for x in sorted(tx.ingest.staged)]
             if not ops:
                 return results
             try:
-                parent = self.git.fetch(branch)
-                tx.w.commit(parent, ops, message or "Update", branch)
+                parent = await aio.run(self.git.fetch, branch)
+                await aio.run(tx.w.commit, parent, ops, message or "Update", branch)
             except NonFastForward as e:
                 last = e
-                time.sleep(1)
+                await asyncio.sleep(1)
                 continue
             except GitHubError as e:
                 raise VfsError(str(e), 502) from None
-            self.refresh(force=True)
+            await self.refresh(force=True)
             return results
         raise VfsError(f"Could not push: {last}", 409)
 
@@ -912,20 +1073,23 @@ class Store:
         return ops, results
 
     # -- maintenance ---------------------------------------------------------------------------
-    def squash(self):
+    async def squash(self):
         """Replace the branch history by one commit with the same files (frees space on GitHub)."""
         branch = config.get("branch")
-        with self._wlock:
-            self.refresh(force=True)
-            parent = self.git.fetch(branch)
+
+        def push(parent):
             with self.git.work() as w:
                 w.commit(parent, [], "Ark Storage: history compacted", branch, squash=True)
+        async with self._wlock:
+            await self.refresh(force=True)
+            parent = await aio.run(self.git.fetch, branch)
+            await aio.run(push, parent)
             self.client._etags.clear()
-            return self.refresh(force=True).key
+            return (await self.refresh(force=True)).key
 
-    def convert_all(self, to_encrypted, progress=None, batch_bytes=200 * 1024 * 1024):
+    async def convert_all(self, to_encrypted, progress=None, batch_bytes=200 * 1024 * 1024):
         """Re-store every file encrypted (or decrypted). Works in batches of one commit each."""
-        idx = self.refresh(force=True)
+        idx = await self.refresh(force=True)
         todo = [n for n in idx.files.nodes.values() if not n.is_dir and n.enc != to_encrypted]
         total = len(todo)
         done = 0
@@ -937,18 +1101,18 @@ class Store:
                 batch.append(todo[i])
                 size += todo[i].size
                 i += 1
-            with self.tx() as tx:
+            async with self.tx() as tx:
                 for n in batch:
-                    cur = self.refresh().files.get(n.path) or n
+                    cur = (await self.refresh()).files.get(n.path) or n
                     r = self.reader(cur)
                     tmp = tx.w.objdir + "/convert.tmp"
-                    with open(tmp, "wb") as f:
-                        for chunk in r.iter():
-                            f.write(chunk)
-                    tx.put(n.path, tmp, mtime=n.mtime, policy="replace", enc=to_encrypted)
+                    async with await anyio.open_file(tmp, "wb") as f:
+                        async for chunk in r.iter():
+                            await f.write(chunk)
+                    await tx.put(n.path, tmp, mtime=n.mtime, policy="replace", enc=to_encrypted)
                     os.remove(tmp)
                     done += 1
                     if progress:
                         progress(done, total, n.path)
-                self.commit(tx, f"{'Encrypt' if to_encrypted else 'Decrypt'} {len(batch)} file(s)")
+                await self.commit(tx, f"{'Encrypt' if to_encrypted else 'Decrypt'} {len(batch)} file(s)")
         return total
