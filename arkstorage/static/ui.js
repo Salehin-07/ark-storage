@@ -83,15 +83,17 @@
       const dlg = h("div", { class: "dlg" + (o.wide ? " wide" : ""), role: "dialog", "aria-modal": "true", "aria-label": o.title || "" },
         o.title ? h("header", null, o.title) : null, o.nav || null, body, foot);
       const scrim = h("div", { class: "scrim" }, dlg);
-      let closed = false;
+      let closed = false, release = () => {};
       const close = (v) => {
-        if (closed) return;
+        if (closed) return true;
         closed = true;
+        release();
         scrim.remove();
         document.removeEventListener("keydown", onKey, true);
         if (prevFocus && prevFocus.focus) prevFocus.focus();
         resolve(v);
         if (o.onClose) o.onClose(v);
+        return true;
       };
       (o.buttons || [{ label: "Close", value: null }]).forEach((b) => {
         foot.append(h("button", { class: "btn " + (b.kind || ""), type: "button", onclick: () => {
@@ -109,6 +111,7 @@
       document.addEventListener("keydown", onKey, true);
       scrim.addEventListener("mousedown", (e) => { if (e.target === scrim && o.dismiss !== false) close(undefined); });
       document.body.append(scrim);
+      release = pushOverlay(() => (o.dismiss === false ? false : close(undefined)));
       const f = dlg.querySelector("[autofocus], input, select, textarea") || foot.querySelector(".primary") || foot.querySelector("button");
       if (f) setTimeout(() => { f.focus(); if (f.select && f.tagName === "INPUT" && o.selectStem) f.select(); }, 30);
       if (o.ready) o.ready(dlg, close);
@@ -138,9 +141,56 @@
       buttons: [{ label: cancel || "Cancel", value: null }, ...options] });
   }
 
+  // ---- back-button aware overlays -----------------------------------------
+  // Viewer, editor and dialogs each take one history entry, so the Back button closes the top overlay
+  // instead of leaving the app (and wiping everything on screen).
+  const overlays = [], skips = [], navFns = [];
+  const idle = () => new Promise((r) => { let n = 0; const t = setInterval(() => { if (!skips.length || ++n > 40) { clearInterval(t); r(); } }, 20); });
+  // history.back() calls are issued one at a time: two quick ones (a dialog and the editor closing together) can be merged by the browser.
+  let backQ = 0, backBusy = false;
+  function drainBack() {
+    if (backBusy || !backQ) return;
+    backQ--; backBusy = true;
+    const tok = {}; let done = false;
+    tok.fin = () => { if (done) return; done = true; const k = skips.indexOf(tok); if (k >= 0) skips.splice(k, 1); backBusy = false; drainBack(); };
+    skips.push(tok); setTimeout(tok.fin, 600);
+    history.back();
+  }
+  function pushOverlay(close) {
+    const e = { close, gone: false };
+    overlays.push(e);
+    try { history.pushState({ ark: 1 }, "", location.href); } catch (x) { /* history unavailable */ }
+    return function release() {
+      if (e.gone) return;
+      e.gone = true;
+      const i = overlays.indexOf(e), top = i === overlays.length - 1;
+      if (i >= 0) overlays.splice(i, 1);
+      if (top) { backQ++; drainBack(); }
+    };
+  }
+  window.addEventListener("popstate", (ev) => {
+    if (skips.length) { const t = skips.shift(); t.fin(); return; }
+    const top = overlays[overlays.length - 1];
+    if (top) {
+      top.gone = true; overlays.pop();
+      Promise.resolve(top.close(true)).then(async (closed) => {
+        if (closed !== false) return;
+        await idle();                                  // the dialog's own Back must land before we put our entry back
+        top.gone = false; overlays.push(top);
+        try { history.pushState({ ark: 1 }, "", location.href); } catch (x) { /* ignore */ }
+      });
+      return;
+    }
+    navFns.forEach((f) => f(ev));
+  });
+  const onNav = (fn) => navFns.push(fn);
+
   // ---- context menu -------------------------------------------------------
-  let openMenu = null;
-  function closeMenu() { if (openMenu) { openMenu.remove(); openMenu = null; } }
+  let openMenu = null, menuOff = null;
+  function closeMenu() {
+    if (menuOff) { menuOff(); menuOff = null; }
+    if (openMenu) { openMenu.remove(); openMenu = null; }
+  }
   function popMenu(x, y, items) {
     closeMenu();
     const m = h("div", { class: "menu", role: "menu" });
@@ -154,9 +204,14 @@
     m.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + "px";
     m.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + "px";
     openMenu = m;
-    const off = (e) => { if (!m.contains(e.target)) { closeMenu(); document.removeEventListener("pointerdown", off, true); } };
-    setTimeout(() => document.addEventListener("pointerdown", off, true), 0);
-    document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { closeMenu(); document.removeEventListener("keydown", esc); } });
+    // Every listener is removed together with the menu. (They used to linger, and an old one would close the *next*
+    // menu on pointerdown, before its button could be clicked: buttons looked frozen.)
+    const off = (e) => { if (!m.contains(e.target)) closeMenu(); };
+    const esc = (e) => { if (e.key === "Escape") closeMenu(); };
+    const t = setTimeout(() => document.addEventListener("pointerdown", off, true), 0);
+    document.addEventListener("keydown", esc, true);
+    window.addEventListener("blur", closeMenu);
+    menuOff = () => { clearTimeout(t); document.removeEventListener("pointerdown", off, true); document.removeEventListener("keydown", esc, true); window.removeEventListener("blur", closeMenu); };
   }
 
   // ---- API ----------------------------------------------------------------
@@ -177,5 +232,5 @@
   }
   const enc = (p) => encodeURIComponent(p);
 
-  window.UI = { h, icon, fmtBytes, fmtDate, toast, modal, ask, prompt, choose, popMenu, closeMenu, api, S, enc };
+  window.UI = { h, icon, fmtBytes, fmtDate, toast, modal, ask, prompt, choose, popMenu, closeMenu, api, S, enc, pushOverlay, onNav };
 })();

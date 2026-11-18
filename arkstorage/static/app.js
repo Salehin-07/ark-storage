@@ -6,7 +6,20 @@
 
   // Start the two requests every page load needs right away and in parallel, instead of session first and
   // the folder listing only after it. (A signed-out visitor just gets a 401 for the listing, which is dropped.)
-  const hashPath = () => { const x = decodeURIComponent(location.hash.slice(1)); return x === "!trash" ? null : x.startsWith("/") ? x : "/"; };
+  // Clean URLs, no "#": /browse/Photos/2024 for a folder, /trash for the trash. Old "#/Photos" links are rewritten once.
+  const urlOf = (path) => (path === "/" ? "/" : "/browse" + path.split("/").map(encodeURIComponent).join("/"));
+  (function legacy() {
+    const x = decodeURIComponent(location.hash.slice(1));
+    if (!x) return;
+    history.replaceState(null, "", x === "!trash" ? "/trash" : x.startsWith("/") ? urlOf(x) : "/");
+  })();
+  const here = () => {
+    const p = location.pathname;
+    if (p === "/trash") return { trash: true, path: null };
+    if (p === "/browse" || p.startsWith("/browse/")) { try { return { path: decodeURIComponent(p.slice(7)) || "/" }; } catch (e) { return { path: "/" }; } }
+    return { path: "/" };
+  };
+  const hashPath = () => here().path;
   const quick = (url) => fetch(url, { credentials: "same-origin" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   const pre = { path: hashPath(), session: quick("/api/session"), list: null };
   if (pre.path) pre.list = quick("/api/list?path=" + enc(pre.path));
@@ -87,7 +100,7 @@
     el.xfer = h("div", { id: "xfer", hidden: true });
     el.nav = {
       files: h("button", { class: "nav on", type: "button", onclick: () => { closeSide(); go("/"); } }, icon("home"), "My files"),
-      trash: h("button", { class: "nav", type: "button", onclick: () => { closeSide(); location.hash = "#!trash"; } }, icon("trash"), "Trash"),
+      trash: h("button", { class: "nav", type: "button", onclick: () => { closeSide(); goTrash(); } }, icon("trash"), "Trash"),
       settings: h("button", { class: "nav", type: "button", onclick: () => { closeSide(); openSettings(); } }, icon("settings"), "Settings"),
     };
     el.usage = h("div", { class: "usage" });
@@ -106,7 +119,7 @@
     bindList();
     bindDrop();
     document.addEventListener("keydown", onKey);
-    window.addEventListener("hashchange", route);
+    window.UI.onNav(route);
   }
   const closeSide = () => el.side && el.side.classList.remove("open");
   function toggleTheme() {
@@ -124,13 +137,18 @@
 
   // ------------------------------------------------------------ routing & loading
   function route() {
-    const hash = decodeURIComponent(location.hash.slice(1));
+    const w = here();
     el.search.value = ""; st.query = "";
-    if (hash === "!trash") return showTrash();
+    if (w.trash) return showTrash();
     st.mode = "files";
-    load(hash.startsWith("/") ? hash : "/");
+    load(w.path);
   }
-  function go(path) { const want = "#" + encodeURI(path).replace(/#/g, "%23"); if (location.hash === want || (path === "/" && !location.hash)) route(); else location.hash = want; }
+  function go(path) {
+    const want = urlOf(path);
+    if (location.pathname !== want) history.pushState(null, "", want);
+    route();
+  }
+  function goTrash() { if (location.pathname !== "/trash") history.pushState(null, "", "/trash"); route(); }
 
   // Folder listings are cached for the session and always revalidated: opening a folder you've seen is instant,
   // and the screen only redraws if GitHub says something changed. Hovering a folder warms its cache.
@@ -341,9 +359,9 @@
       if (row && row.dataset.dir && !row.dataset.pending && st.mode === "files") prefetchDir(row.dataset.path);   // the click follows ~100 ms later
       else if (warmable(row)) warmFile(row.dataset.path);
       if (lastPointer === "touch" && row && !e.target.closest(".chk")) {
-        pressed = false;
+        pressed = false; clearTimeout(pressTimer);
         const sx = e.clientX, sy = e.clientY;
-        pressTimer = setTimeout(() => { pressed = true; if (navigator.vibrate) navigator.vibrate(15); toggleSel(row.dataset.path); }, 450);
+        pressTimer = setTimeout(() => { pressed = true; if (navigator.vibrate) navigator.vibrate(15); toggleSel(row.dataset.path); setTimeout(() => { pressed = false; }, 900); }, 450);
         const cancel = (ev) => { if (ev.type === "pointermove" && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 8) return; clearTimeout(pressTimer); L.removeEventListener("pointermove", cancel); L.removeEventListener("pointerup", cancel); L.removeEventListener("pointercancel", cancel); };
         L.addEventListener("pointermove", cancel); L.addEventListener("pointerup", cancel); L.addEventListener("pointercancel", cancel);
       }
@@ -356,7 +374,7 @@
       else if (warmable(row)) hoverT = setTimeout(() => warmFile(row.dataset.path), 150);
     });
     L.addEventListener("click", (e) => {
-      if (pressed) { pressed = false; return; }
+      if (pressed) { pressed = false; e.preventDefault(); return; }
       const row = e.target.closest(".row");
       if (!row) { if (!e.target.closest(".head") && !band.moved) { st.sel = []; paint(); } return; }
       const path = row.dataset.path;
@@ -533,10 +551,11 @@
     }
     const step = (d) => { i = (i + d + items.length) % items.length; show(); };
     const onk = (e) => { if (e.key === "Escape") close(); else if (e.key === "ArrowRight" && !/AUDIO|VIDEO/.test(document.activeElement.tagName)) step(1); else if (e.key === "ArrowLeft" && !/AUDIO|VIDEO/.test(document.activeElement.tagName)) step(-1); };
-    function close() { cleanup(); document.removeEventListener("keydown", onk); v.remove(); }
+    let release = () => {};
+    function close() { if (!v.isConnected) return true; cleanup(); document.removeEventListener("keydown", onk); v.remove(); release(); return true; }
     let tx = 0; v.addEventListener("touchstart", (e) => { tx = e.touches[0].clientX; }, { passive: true });
     v.addEventListener("touchend", (e) => { const dx = e.changedTouches[0].clientX - tx; if (Math.abs(dx) > 70 && items[i].kind === "image") step(dx < 0 ? 1 : -1); }, { passive: true });
-    document.addEventListener("keydown", onk); document.body.append(v); show(); v.focus();
+    document.addEventListener("keydown", onk); document.body.append(v); release = window.UI.pushOverlay(close); show(); v.focus();
   }
 
   // ------------------------------------------------------------ actions
@@ -879,7 +898,7 @@
     const d = await guard(() => api("/api/jobs")); if (!d) return;
     for (const j of d.jobs.filter((x) => x.state === "running" && !st.jobs.includes(x.id))) { st.jobs.push(j.id); trackJob(j); }
   }
-  async function logout() { await guard(() => api("/api/logout", { method: "POST", body: {} })); location.hash = ""; location.reload(); }
+  async function logout() { await guard(() => api("/api/logout", { method: "POST", body: {} })); location.href = "/"; }
 
   boot();
 })();

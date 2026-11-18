@@ -40,7 +40,7 @@ w.fetch = (url, init = {}) => {
 const load = (f) => w.eval(fs.readFileSync(path.join(root, f), "utf8"));
 const errors = [];
 w.addEventListener("error", (e) => errors.push(e.message));
-["files-core.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "progress.js", "pdfview.js", "app.js"].forEach(load);
+["files-core.js", "hljs/highlight.bundle.js", "editor-core.js", "ui.js", "editor.js", "settings.js", "progress.js", "pdfview.js", "app.js"].forEach(load);
 const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 const q = (s) => w.document.querySelector(s), qa = (s) => [...w.document.querySelectorAll(s)];
 let fails = 0;
@@ -79,7 +79,7 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   const ta = q("#ta"); ta.setSelectionRange(5, 5);
   ta.dispatchEvent(new w.KeyboardEvent("keydown", { key: "(", bubbles: true, cancelable: true }));
   ok(true, "editor keydown handled without throwing");
-  q("#editor .btn:last-child").click(); await tick(); q(".scrim") && q(".scrim").remove(); q("#editor") && q("#editor").remove();
+  q("#editor .ebar > .btn:last-child").click(); await tick(); q(".scrim") && q(".scrim").remove(); q("#editor") && q("#editor").remove();
   // ---- instant feedback: the new folder is on screen before GitHub has answered
   slow = 400;
   q("#fab").click(); await tick();

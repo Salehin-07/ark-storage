@@ -281,6 +281,13 @@ def create_app(testing=False):
         return Response(index_html(), media_type="text/html; charset=utf-8",
                         headers={"Cache-Control": "no-cache", "Content-Security-Policy": CSP})
 
+    # Clean client-side routes (/browse/Photos, /trash): the same page, so reloads and shared links land in the right place.
+    @app.api_route("/browse", methods=["GET", "HEAD"])
+    @app.api_route("/browse/{rest:path}", methods=["GET", "HEAD"])
+    @app.api_route("/trash", methods=["GET", "HEAD"])
+    async def spa_routes(rest: str = ""):
+        return await index()
+
     @app.api_route("/static/{name:path}", methods=["GET", "HEAD"])
     async def static_files(name: str, request: Request):
         target = (STATIC / name).resolve()

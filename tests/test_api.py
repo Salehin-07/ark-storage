@@ -137,6 +137,18 @@ class ApiTests(ApiCase):
                 self.assertEqual(a.c.get("/static/" + js).status_code, 200, js)
             self.assertEqual(a.c.get("/static/../app.py").status_code, 404)
             self.assertEqual(a.c.get("/healthz").get_json()["ok"], True)
+            self.assertEqual(a.c.get("/static/hljs/highlight.bundle.js").status_code, 200)
+
+    def test_clean_urls_serve_the_app(self):
+        # /browse/<folder> and /trash replace the old "#/folder" links: a reload or a shared link must open the app, not a 404
+        with sandbox() as (st, remote):
+            a = Api(st, remote)
+            home = a.c.get("/").get_data(as_text=True)
+            for url in ("/browse", "/browse/Photos/2024", "/browse/with%20space/%E0%A6%85", "/trash"):
+                r = a.c.get(url)
+                self.assertEqual(r.status_code, 200, url)
+                self.assertEqual(r.get_data(as_text=True), home, url)
+            self.assertEqual(a.c.get("/api/trash").status_code, 401)      # the API route of the same name is untouched
 
     def test_assets_logo_cache_and_gzip(self):
         with sandbox() as (st, remote):

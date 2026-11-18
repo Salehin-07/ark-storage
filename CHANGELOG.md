@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.1 - code editor, clean URLs, Back button, frozen buttons
+
+**Code editor**
+* **Syntax colours** for ~50 languages (Python, JS/TS, HTML/Vue, CSS, JSON, YAML, Markdown, shell, C/C++/C#, Java, Go, Rust, SQL, Dockerfile...), light and dark themes, bundled highlight.js (no CDN). The language can be changed from the status bar; files over 600 KB stay uncoloured so typing stays instant.
+* **Indentation works.** The detected indent was stored as an object instead of a string, which broke Tab, Enter and Backspace indentation. Auto-indent after `:` / `{` / `(`, Tab/Shift+Tab on selections, and an indent switcher (Tabs / 2 / 4 / 8) in the status bar.
+* **Auto-closing brackets and quotes work on phones too.** Typing is now handled on `beforeinput` (phone keyboards send no usable key on `keydown`), with a fallback for keyboards that commit symbols as composition text.
+* New UI: current-line highlight, line numbers that stay aligned with wrapped lines, language/indent/position in the status bar, and a **symbol bar** on touch screens (Tab, undo/redo, `{ } ( ) [ ] " ' ; : = ...`).
+
+**Navigation and buttons**
+* **No more `#` in the address.** Folders are `/browse/Photos/2024`, the trash is `/trash`; old `#/folder` links are converted automatically, and reloading or sharing such a link opens the right place.
+* **Back button no longer wipes the screen.** The viewer, editor and dialogs each take one history entry, so Back closes them (asking first if the editor has unsaved changes) and moves up through folders instead of leaving the app.
+* **Frozen / unresponsive buttons fixed.** A leftover listener from an earlier context menu closed the next menu on pointer-down, before its button could be clicked; a touch long-press could also swallow the next tap. Menus now clean up after themselves.
+
 ## 2.0.0 - async rewrite on FastAPI + uvicorn
 
 **Faster, with the same UI and the same repository format.** Measured over real HTTP on loopback with a local git repo
