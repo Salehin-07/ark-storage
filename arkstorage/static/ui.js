@@ -186,28 +186,42 @@
   const onNav = (fn) => navFns.push(fn);
 
   // ---- context menu -------------------------------------------------------
-  let openMenu = null, menuOff = null;
+  let openMenu = null, menuOff = null, menuPrev = null;
   function closeMenu() {
     if (menuOff) { menuOff(); menuOff = null; }
     if (openMenu) { openMenu.remove(); openMenu = null; }
+    // keyboard users land back where they were (a dialog opened by the chosen item then takes focus itself)
+    if (menuPrev && menuPrev.isConnected && document.activeElement === document.body) { try { menuPrev.focus({ preventScroll: true }); } catch (e) { /* ignore */ } }
+    menuPrev = null;
   }
   function popMenu(x, y, items) {
     closeMenu();
-    const m = h("div", { class: "menu", role: "menu" });
+    menuPrev = document.activeElement;
+    const m = h("div", { class: "menu", role: "menu", tabindex: "-1" });
     items.forEach((it) => {
       if (it === "-") { m.append(h("hr")); return; }
       if (!it) return;
-      m.append(h("button", { type: "button", role: "menuitem", class: it.danger ? "danger" : "", onclick: () => { closeMenu(); it.run(); } }, it.icon ? icon(it.icon) : null, it.label));
+      m.append(h("button", { type: "button", role: "menuitem", class: it.danger ? "danger" : "", onclick: () => { closeMenu(); it.run(); } }, it.icon ? icon(it.icon) : null, h("span", { class: "lbl" }, it.label), it.hint ? h("span", { class: "kbd" }, it.hint) : null));
     });
     document.body.append(m);
     const r = m.getBoundingClientRect();
     m.style.left = Math.max(8, Math.min(x, innerWidth - r.width - 8)) + "px";
     m.style.top = Math.max(8, Math.min(y, innerHeight - r.height - 8)) + "px";
     openMenu = m;
+    m.focus({ preventScroll: true });
     // Every listener is removed together with the menu. (They used to linger, and an old one would close the *next*
     // menu on pointerdown, before its button could be clicked: buttons looked frozen.)
     const off = (e) => { if (!m.contains(e.target)) closeMenu(); };
-    const esc = (e) => { if (e.key === "Escape") closeMenu(); };
+    const esc = (e) => {
+      if (e.key === "Escape") { closeMenu(); return; }
+      const items = [...m.querySelectorAll("button")]; if (!items.length) return;
+      const i = items.indexOf(document.activeElement), last = items.length - 1;
+      let n = -1;
+      if (e.key === "ArrowDown" || (e.key === "Tab" && !e.shiftKey)) n = i >= last ? 0 : i + 1;
+      else if (e.key === "ArrowUp" || (e.key === "Tab" && e.shiftKey)) n = i <= 0 ? last : i - 1;
+      else if (e.key === "Home") n = 0; else if (e.key === "End") n = last;
+      if (n >= 0) { e.preventDefault(); e.stopPropagation(); items[n].focus(); }
+    };
     const t = setTimeout(() => document.addEventListener("pointerdown", off, true), 0);
     document.addEventListener("keydown", esc, true);
     window.addEventListener("blur", closeMenu);

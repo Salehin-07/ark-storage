@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.3 - desktop and responsive polish, clearer hover / click / selection
+
+**Mouse and laptop/desktop**
+* **Hover only where hovering exists.** Rows, buttons, menus and tabs used to stay "hovered" after a tap on phones and tablets; hover styles are now limited to devices with a real pointer, and touch gets proper pressed states instead.
+* **Clear selection states.** Selected rows get an accent bar, hover over a selected row is distinct, keyboard focus has an inset ring, grid cards lift on hover and show a ring when selected.
+* **A "more" button (⋯) on every row and card** opens the same menu as right-click. It is always visible on touch screens, which had no way to reach the menu except the selection bar.
+* **Keyboard:** arrow keys now move *and* select (Shift extends the range, Ctrl only moves focus, Space toggles), Home/End/PageUp/PageDown, Left/Right in grid view, type a few letters to jump to a name, and the Menu key / Shift+F10 opens the menu next to the row.
+* **Menus** open with a short animation, can be driven with Up/Down/Home/End/Tab, give focus back when closed, and show shortcut hints (Enter, F2, Ctrl/⌘+C, Ctrl/⌘+X, Del, Shift+Del).
+* **Collapsible sidebar** on desktop (the menu button remembers its state); thin scrollbars; wider columns on large screens and tighter ones on small laptops; dialogs sized for dynamic viewports.
+
+**Responsive**
+* Tablet / small-laptop layout (820-1100 px), landscape phones, narrow phones (<=420 px).
+* The phone sidebar is a drawer with a tap-to-close backdrop and safe-area padding; toasts no longer cover the "+" button; touch targets grow to 44-56 px on touch screens; grid view uses smaller cards on phones.
+* Removed the 300 ms tap delay and the iOS long-press callout on rows.
+
 ## 2.0.2 - share links preview the file and work with `curl | sh`
 
 * **Share links now open a preview page** in a browser instead of forcing a download: images, video, audio, PDFs, Word/Excel/PowerPoint and text/code (syntax coloured, line numbers) are shown, with **Download**, **Raw** and **Copy link** buttons. Files that can't be previewed get a clean Download card.

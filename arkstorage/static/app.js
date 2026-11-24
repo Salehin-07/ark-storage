@@ -107,21 +107,29 @@
     el.side = h("aside", { id: "side" }, el.nav.files, el.nav.trash, el.nav.settings, el.usage,
       h("button", { class: "nav", type: "button", onclick: logout }, icon("logout"), "Sign out"));
     const top = h("header", { id: "top" },
-      h("button", { class: "btn icon ghost", id: "menu-btn", style: { display: "none" }, type: "button", "aria-label": "Menu", onclick: () => el.side.classList.toggle("open") }, icon("menu")),
+      h("button", { class: "btn icon ghost", id: "menu-btn", type: "button", "aria-label": "Toggle sidebar", title: "Toggle sidebar", onclick: toggleSide }, icon("menu")),
       h("div", { id: "search" }, icon("search"), el.search),
       btn("", "up", () => { el.xferOpen = true; st.xferOpen = true; renderXfer(); }, "icon ghost hide-m", "Transfers"),
       btn("", "sun", toggleTheme, "icon ghost", "Toggle theme"));
     el.fab = h("button", { id: "fab", type: "button", "aria-label": "New", onclick: (e) => newMenu(e.currentTarget) }, icon("plus"));
     el.sync = h("div", { id: "sync", "aria-hidden": "true" });
+    el.scrim = h("div", { id: "side-scrim", onclick: closeSide });
     el.main = h("main", { id: "main" }, el.sync, el.bar, el.banner, el.selBar, el.wrap, el.statusBar);
-    app.replaceChildren(top, el.side, el.main, el.xfer, el.fab, el.fileIn, el.dirIn);
+    app.replaceChildren(top, el.side, el.scrim, el.main, el.xfer, el.fab, el.fileIn, el.dirIn);
+    app.classList.toggle("side-off", localStorage.getItem("ark.side") === "off");
     renderViewSeg();
     bindList();
     bindDrop();
     document.addEventListener("keydown", onKey);
     window.UI.onNav(route);
   }
-  const closeSide = () => el.side && el.side.classList.remove("open");
+  const narrow = matchMedia("(max-width: 820px)");
+  const closeSide = () => { if (el.side) el.side.classList.remove("open"); if (el.scrim) el.scrim.classList.remove("on"); };
+  function toggleSide() {
+    if (narrow.matches) { const on = el.side.classList.toggle("open"); el.scrim.classList.toggle("on", on); return; }
+    const off = app.classList.toggle("side-off"); localStorage.setItem("ark.side", off ? "off" : "on");
+  }
+  narrow.addEventListener("change", closeSide);
   function toggleTheme() {
     const dark = document.documentElement.dataset.mode === "dark";
     localStorage.setItem("ark.theme", dark ? "light" : "dark"); applyTheme();
@@ -280,7 +288,7 @@
       if (st.view === "list") {
         const all = h("input", { type: "checkbox", class: "chk" + (st.sel.length ? " always" : ""), "aria-label": "Select all", checked: st.sel.length === shown.length, onclick: (e) => { e.stopPropagation(); st.sel = e.target.checked ? shown.map((x) => x.path) : []; paint(); } });
         const hb = (key, label) => h("button", { type: "button", class: key === "mtime" ? "c-md" : "", onclick: () => { st.sort = { key, dir: st.sort.key === key ? -st.sort.dir : 1 }; localStorage.setItem("ark.sort", JSON.stringify(st.sort)); render(); } }, label, st.sort.key === key ? h("span", null, st.sort.dir > 0 ? "▲" : "▼") : null);
-        kids.push(h("div", { class: "head" }, all, hb("name", "Name"), hb("size", "Size"), hb("mtime", "Modified")));
+        kids.push(h("div", { class: "head" }, all, hb("name", "Name"), hb("size", "Size"), hb("mtime", "Modified"), h("span")));
       }
       shown.forEach((e) => kids.push(rowEl(e)));
     }
@@ -302,7 +310,8 @@
       h("input", { type: "checkbox", class: "chk", tabindex: -1, "aria-label": "Select " + e.name }),
       h("div", { class: "nm" }, ic, h("span", { class: "t", title: e.path }, e.name), tip, e.pending ? icon("refresh", "spin") : null, st.mode === "search" ? h("span", { class: "muted", style: { fontSize: "12px" } }, e.path) : null),
       h("div", { class: "sz" }, e.dir ? (e.items != null ? e.items + (e.items === 1 ? " item" : " items") : "") : fmtBytes(e.size)),
-      h("div", { class: "md" }, fmtDate(e.mtime)));
+      h("div", { class: "md" }, fmtDate(e.mtime)),
+      e.pending ? h("span") : h("button", { type: "button", class: "more", tabindex: -1, "aria-label": "More actions for " + e.name, title: "More actions", "aria-haspopup": "menu" }, icon("more")));
     r.dataset.path = e.path;
     if (e.dir) r.dataset.dir = "1"; else r.dataset.kind = e.kind;
     if (e.pending) r.dataset.pending = "1";
@@ -378,6 +387,13 @@
       const row = e.target.closest(".row");
       if (!row) { if (!e.target.closest(".head") && !band.moved) { st.sel = []; paint(); } return; }
       const path = row.dataset.path;
+      const mb = e.target.closest(".more");
+      if (mb) {
+        e.stopPropagation();
+        if (!st.sel.includes(path)) { st.sel = [path]; st.anchor = path; paint(); }
+        const b = mb.getBoundingClientRect(); rowMenu(st.view === "grid" ? b.left : Math.max(8, b.right - 230), b.bottom + 4);
+        return;
+      }
       if (e.target.classList.contains("chk")) { toggleSel(path); return; }
       if (lastPointer === "touch") {
         if (st.sel.length) toggleSel(path); else openPath(path);
@@ -386,12 +402,23 @@
       const r = FC.applyClick(st.shown.map((x) => x.path), st.sel, st.anchor, path, { mod: e.ctrlKey || e.metaKey, shift: e.shiftKey });
       st.sel = r.selected; st.anchor = r.anchor; paint();
     });
-    L.addEventListener("dblclick", (e) => { const row = e.target.closest(".row"); if (row && lastPointer !== "touch") openPath(row.dataset.path); });
-    L.addEventListener("keydown", (e) => { const row = e.target.closest(".row"); if (row && e.key === "Enter") { e.preventDefault(); openPath(row.dataset.path); } else if (row && e.key === " ") { e.preventDefault(); toggleSel(row.dataset.path); } else if (row && (e.key === "ArrowDown" || e.key === "ArrowUp")) { e.preventDefault(); const n = e.key === "ArrowDown" ? row.nextElementSibling : row.previousElementSibling; if (n && n.classList.contains("row")) n.focus(); } });
+    L.addEventListener("dblclick", (e) => { const row = e.target.closest(".row"); if (row && row.dataset.path && !e.target.closest(".more, .chk") && lastPointer !== "touch") openPath(row.dataset.path); });
+    L.addEventListener("keydown", (e) => {
+      const row = e.target.closest(".row");
+      if (!row || !row.dataset.path || e.target.closest(".more") && (e.key === "Enter" || e.key === " ")) return;
+      if (e.key === "Enter") { e.preventDefault(); openPath(row.dataset.path); }
+      else if (e.key === " ") { e.preventDefault(); toggleSel(row.dataset.path); }
+      else if (rowNav(e, row)) { /* handled */ }
+      else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && e.key !== "/") typeAhead(e.key, row);
+    });
     L.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       const row = e.target.closest(".row");
-      if (row) { if (!st.sel.includes(row.dataset.path)) { st.sel = [row.dataset.path]; st.anchor = row.dataset.path; paint(); } rowMenu(e.clientX, e.clientY); }
+      if (row && !row.dataset.path) return;
+      if (row) {
+        if (!st.sel.includes(row.dataset.path)) { st.sel = [row.dataset.path]; st.anchor = row.dataset.path; paint(); }
+        if (!e.clientX && !e.clientY) { const b = row.getBoundingClientRect(); rowMenu(b.left + Math.min(b.width / 2, 120), b.top + b.height / 2); } else rowMenu(e.clientX, e.clientY);
+      }
       else if (st.mode === "files") popMenu(e.clientX, e.clientY, [{ label: "New folder", icon: "folderplus", run: newFolder }, { label: "New file", icon: "fileplus", run: newFile }, { label: "Upload files", icon: "upload", run: () => el.fileIn.click() }, st.clip ? { label: "Paste", icon: "paste", run: doPaste } : null]);
     });
     // rubber band (mouse)
@@ -421,6 +448,46 @@
   }
   function toggleSel(path) { const r = FC.applyClick(st.shown.map((x) => x.path), st.sel, st.anchor, path, { touch: true }); st.sel = r.selected; st.anchor = r.anchor; paint(); }
 
+  // Arrow keys move AND select (Shift extends the range, Ctrl only moves focus; Space toggles). Grid view also uses Left/Right.
+  function rowNav(e, row) {
+    const rows = [...el.list.querySelectorAll(".row[data-path]")], i = rows.indexOf(row);
+    if (i < 0) return false;
+    const grid = st.view === "grid";
+    const cols = grid ? Math.max(1, rows.filter((r) => r.offsetTop === rows[0].offsetTop).length) : 1;
+    const page = Math.max(1, Math.floor(el.wrap.clientHeight / Math.max(1, row.offsetHeight + (grid ? 12 : 0))) - 1) * cols;
+    let j;
+    switch (e.key) {
+      case "ArrowDown": j = i + cols; break;
+      case "ArrowUp": j = i - cols; break;
+      case "ArrowRight": if (!grid) return false; j = i + 1; break;
+      case "ArrowLeft": if (!grid) return false; j = i - 1; break;
+      case "PageDown": j = i + page; break;
+      case "PageUp": j = i - page; break;
+      case "Home": j = 0; break;
+      case "End": j = rows.length - 1; break;
+      default: return false;
+    }
+    e.preventDefault();
+    j = Math.max(0, Math.min(rows.length - 1, j));
+    const t = rows[j]; t.focus();
+    if (e.ctrlKey || e.metaKey) return true;
+    const path = t.dataset.path, from = st.anchor && st.shown.some((x) => x.path === st.anchor) ? st.anchor : row.dataset.path;
+    if (e.shiftKey) { st.sel = FC.rangeBetween(st.shown.map((x) => x.path), from, path); st.anchor = from; } else { st.sel = [path]; st.anchor = path; }
+    paint();
+    return true;
+  }
+  // Type a few letters to jump to the next item whose name starts with them (like Explorer / Finder).
+  let taBuf = "", taT = 0;
+  function typeAhead(ch, row) {
+    taBuf += ch.toLowerCase(); clearTimeout(taT); taT = setTimeout(() => { taBuf = ""; }, 700);
+    const rows = [...el.list.querySelectorAll(".row[data-path]")], from = rows.indexOf(row) + (taBuf.length === 1 ? 1 : 0);
+    for (let k = 0; k < rows.length; k++) {
+      const r = rows[(from + k) % rows.length];
+      if ((r.getAttribute("aria-label") || "").toLowerCase().startsWith(taBuf)) { r.focus(); st.sel = [r.dataset.path]; st.anchor = r.dataset.path; paint(); return; }
+    }
+  }
+  const MOD = /Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌘" : "Ctrl+";
+
   function onKey(e) {
     if (document.querySelector(".scrim, #viewer, #editor") || /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) || st.mode === "trash" && !e.ctrlKey) return;
     const mod = e.ctrlKey || e.metaKey, es = selEntries();
@@ -442,18 +509,18 @@
   function rowMenu(x, y) {
     const es = selEntries(), one = es.length === 1 ? es[0] : null;
     popMenu(x, y, [
-      one ? { label: "Open", icon: "play", run: () => openPath(one.path) } : null,
+      one ? { label: "Open", icon: "play", hint: "Enter", run: () => openPath(one.path) } : null,
       { label: "Download" + (es.length > 1 || (one && one.dir) ? " (zip)" : ""), icon: "download", run: () => downloadSel(es) },
       one && !one.dir ? { label: "Share link…", icon: "link", run: () => share(one) } : null, "-",
-      one ? { label: "Rename", icon: "edit", run: () => rename(one) } : null,
-      { label: "Copy", icon: "copy", run: () => setClip(false) }, { label: "Cut", icon: "cut", run: () => setClip(true) },
+      one ? { label: "Rename", icon: "edit", hint: "F2", run: () => rename(one) } : null,
+      { label: "Copy", icon: "copy", hint: MOD + "C", run: () => setClip(false) }, { label: "Cut", icon: "cut", hint: MOD + "X", run: () => setClip(true) },
       one && one.dir && st.clip ? { label: "Paste into folder", icon: "paste", run: () => doPaste(one.path) } : null, "-",
       { label: "Compress to zip", icon: "zip", run: () => compress(es) },
       one && /\.zip$/i.test(one.name) ? { label: "Extract here", icon: "archive", run: () => extract(one) } : null,
       one && !one.dir && one.kind === "text" ? { label: "Edit", icon: "edit", run: () => editPath(one) } : null,
       one ? { label: "Properties", icon: "info", run: () => props(one) } : null, "-",
-      { label: trashOn() ? "Move to trash" : "Delete forever", icon: "trash", danger: true, run: () => del(es) },
-      trashOn() ? { label: "Delete forever…", icon: "x", danger: true, run: () => del(es, true) } : null]);
+      { label: trashOn() ? "Move to trash" : "Delete forever", icon: "trash", danger: true, hint: "Del", run: () => del(es) },
+      trashOn() ? { label: "Delete forever…", icon: "x", danger: true, hint: "Shift+Del", run: () => del(es, true) } : null]);
   }
 
   // ------------------------------------------------------------ opening things

@@ -66,6 +66,28 @@ const ok = (c, m) => { if (!c) { fails++; console.log("FAIL:", m); } else consol
   rows[1].dispatchEvent(new w.MouseEvent("contextmenu", { bubbles: true })); await tick();
   ok(!!q(".menu") && /Delete/.test(q(".menu").textContent), "context menu");
   w.document.dispatchEvent(new w.KeyboardEvent("keydown", { key: "Escape" })); q(".menu") && q(".menu").remove();
+  // 2.0.3: per-row "more" button, keyboard selection, type-ahead, menu keyboard navigation, sidebar toggle
+  const key = (el, k, o = {}) => el.dispatchEvent(new w.KeyboardEvent("keydown", { key: k, bubbles: true, ...o }));
+  ok(qa(".row .more").length === files.length && !!q(".head > span:last-child"), "every row has a more-actions button and the header has a matching empty cell");
+  rows[0].focus(); key(rows[0], "ArrowDown"); await tick();
+  ok(qa(".row.sel").length === 1 && rows[1].classList.contains("sel") && w.document.activeElement === rows[1], "ArrowDown moves focus and selection");
+  key(rows[1], "ArrowDown", { shiftKey: true }); await tick();
+  ok(qa(".row.sel").length === 2 && rows[2].classList.contains("sel"), "Shift+ArrowDown extends the selection");
+  key(rows[2], "End"); await tick();
+  ok(qa(".row.sel").length === 1 && rows[rows.length - 1].classList.contains("sel"), "End selects the last item");
+  key(rows[rows.length - 1], "p"); await tick();
+  ok(rows[4].classList.contains("sel") && w.document.activeElement === rows[4], "typing a letter jumps to the next item starting with it");
+  rows[4].querySelector(".more").click(); await tick();
+  ok(!!q(".menu") && /Rename/.test(q(".menu").textContent) && rows[4].classList.contains("sel"), "more button selects the row and opens its menu");
+  ok(/F2/.test(q(".menu").textContent), "menu items show keyboard shortcuts");
+  key(w.document.body, "ArrowDown"); await tick();
+  ok(w.document.activeElement && w.document.activeElement.closest(".menu") && w.document.activeElement.tagName === "BUTTON", "ArrowDown moves focus into the menu");
+  key(w.document.body, "Escape"); await tick();
+  ok(!q(".menu"), "Escape closes the menu");
+  q("#menu-btn").click(); await tick();
+  ok(q("#app").classList.contains("side-off"), "sidebar button collapses the sidebar on desktop");
+  q("#menu-btn").click(); await tick();
+  ok(!q("#app").classList.contains("side-off"), "and expands it again");
   qa(".row").find((r) => r.dataset.path === "/pic.png").dispatchEvent(new w.MouseEvent("dblclick", { bubbles: true })); await tick();
   ok(!!q("#viewer") && !!q("#vstage .vload"), "double click on an image opens the viewer with a loading indicator (never a blank screen)");
   w.document.dispatchEvent(new w.KeyboardEvent("keydown", { key: "ArrowRight" })); await tick();
