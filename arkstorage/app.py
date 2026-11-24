@@ -7,6 +7,7 @@ uploads and downloads move through the loop in 1 MiB steps with back-pressure fr
 import asyncio
 import contextlib
 import gzip
+import html as htmllib
 import inspect
 import mimetypes
 import os
@@ -70,6 +71,14 @@ EXTRA_MIME = {"md": "text/plain", "py": "text/plain", "json": "application/json"
               "ppt": "application/vnd.ms-powerpoint", "pps": "application/vnd.ms-powerpoint", "rtf": "application/rtf",
               "odt": "application/vnd.oasis.opendocument.text", "ods": "application/vnd.oasis.opendocument.spreadsheet",
               "odp": "application/vnd.oasis.opendocument.presentation"}
+
+
+def _human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 def ext_of(name):
@@ -451,10 +460,10 @@ def create_app(testing=False):
         return await jr(request, dict(existing=[p for p in map(vfs.norm, d.paths) if i.files.get(p)]))
 
     # ---------------------------------------------------------------- reading
-    async def serve_file(request, n, i, download=False):
+    async def serve_file(request, n, i, download=False, ctype=None):
         reader = store.reader(n, i)
         size = n.size
-        ct = mime_of(n.name)
+        ct = ctype or mime_of(n.name)
         h = {"Accept-Ranges": "bytes", "ETag": f'"{n.sha[:16]}"', "Cache-Control": "private, max-age=0, must-revalidate"}
         quoted = n.name.replace('"', "")
         ascii_name = quoted.encode("ascii", "replace").decode().replace("?", "_")
@@ -497,11 +506,8 @@ def create_app(testing=False):
         i = await store.refresh()
         return await serve_file(request, node_of(i, path, file=True), i, download=download == "1")
 
-    @router.get("/api/preview-pdf")
-    async def preview_pdf(request: Request, path: str = ""):
+    async def office_pdf(request, n, i):
         """Old Office formats (.doc, .ppt, .odt, ...) as a PDF, converted once with LibreOffice when it is installed."""
-        i = await store.refresh()
-        n = node_of(i, path, file=True)
         if EXT_KIND.get(ext_of(n.name)) != "office" or ext_of(n.name) in OFFICE_CLIENT:
             raise VfsError("This file is shown directly in the browser", 400)
         pdf, data = await office.to_pdf(n, store.reader(n, i))
@@ -513,6 +519,11 @@ def create_app(testing=False):
             h["Content-Range"] = f"bytes {rng[0]}-{rng[1]}/{len(data)}"
             return Response(data[rng[0]:rng[1] + 1], status_code=206, headers=h, media_type="application/pdf")
         return Response(data, headers=h, media_type="application/pdf")
+
+    @router.get("/api/preview-pdf")
+    async def preview_pdf(request: Request, path: str = ""):
+        i = await store.refresh()
+        return await office_pdf(request, node_of(i, path, file=True), i)
 
     @router.post("/api/warm")
     async def warm(d: S.PathBody):
@@ -887,17 +898,92 @@ def create_app(testing=False):
         return await jr(request, dict(job=jobs.start("extract", f"Extract {n.name}", run).to_dict()))
 
     # ---------------------------------------------------------------- sharing
+    # One link, two behaviours. A browser (it asks for text/html) gets a preview page with Download / Raw / Copy buttons;
+    # anything else (curl, wget, fetch, Invoke-WebRequest...) gets the file's bytes, so ``curl -fsSL <link> | sh`` works.
+    # ?raw=1 forces the bytes, ?download=1 forces a download, ?preview=1 forces the page. The file name after the token is
+    # decoration (it makes ``curl -O`` and the address bar look right); the token alone identifies the file.
+    TOOL_UA = re.compile(r"^(curl|wget|fetch|httpie|python-requests|python-urllib|go-http|libwww|powershell|windowspowershell|"
+                         r"aria2|axios|node-fetch|okhttp|java|ruby|php|perl)", re.I)
+    RUNNERS = {"sh": "sh", "bash": "bash", "zsh": "zsh", "ksh": "ksh", "py": "python3 -", "js": "node", "mjs": "node",
+               "rb": "ruby", "pl": "perl", "php": "php", "lua": "lua"}
+
+    def base_url(request):
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        return f"{scheme}://{host}"
+
+    def share_path(token, name):
+        return f"/s/{token}/{quote(name, safe='')}"
+
+    def share_commands(url, name):
+        """Ready-to-paste shell commands for the share page: run it (scripts only) and save it."""
+        out = []
+        ext = ext_of(name)
+        if ext in RUNNERS:
+            out.append(("Run", f"curl -fsSL {url} | {RUNNERS[ext]}"))
+        elif ext == "ps1":
+            out.append(("Run (PowerShell)", f"irm {url} | iex"))
+        out.append(("Save", f"curl -fLO {url}"))
+        return out
+
+    def wants_page(request, q):
+        if q.get("raw") or q.get("download") or q.get("pdf"):
+            return False
+        if q.get("preview") == "1":
+            return True
+        if TOOL_UA.match(request.headers.get("user-agent", "")):
+            return False
+        return "text/html" in request.headers.get("accept", "")
+
+    def share_page(request, token, n):
+        name, kind, ext = n.name, kind_of(n.name), ext_of(n.name)
+        url = base_url(request) + share_path(token, name)
+        e = htmllib.escape
+        cmds = "".join(f'<div class="cmd"><span class="cl">{e(label)}</span><code>{e(c)}</code>'
+                       f'<button class="btn" type="button" data-copy="{e(c)}">Copy</button></div>' for label, c in share_commands(url, name))
+        desc = f"{name} - {_human(n.size)} - shared from Ark Storage"
+        doc = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{e(name)} - Ark Storage</title>
+<meta name="robots" content="noindex, nofollow"><meta name="theme-color" content="#0f1115">
+<meta name="ark-version" content="{__version__}">
+<meta property="og:title" content="{e(name)}"><meta property="og:description" content="{e(desc)}"><meta property="og:type" content="website">
+<link rel="icon" href="/static/icon-32.png?v={__version__}" type="image/png" sizes="32x32">
+<link rel="stylesheet" href="/static/style.css?v={__version__}"><link rel="stylesheet" href="/static/share.css?v={__version__}">
+</head><body class="share">
+<header class="sh-head">
+  <img src="/static/icon-192.png?v={__version__}" alt="" width="36" height="36">
+  <div class="sh-title"><h1 title="{e(name)}">{e(name)}</h1><p class="muted">{e(_human(n.size))} &middot; {e(mime_of(name))}</p></div>
+  <div class="sh-actions">
+    <a class="btn" id="sh-raw" href="{e(share_path(token, name))}?raw=1" target="_blank" rel="noopener">Raw</a>
+    <button class="btn" type="button" id="sh-link" data-copy="{e(url)}">Copy link</button>
+    <a class="btn primary" id="sh-dl" href="{e(share_path(token, name))}?download=1">Download</a>
+  </div>
+</header>
+<section class="sh-cmds" aria-label="Command line">{cmds}</section>
+<main id="sh-view" class="sh-view" data-kind="{e(kind)}" data-ext="{e(ext)}" data-name="{e(name)}" data-size="{n.size}"
+      data-raw="{e(share_path(token, name))}?raw=1" data-convert="{1 if office.available() else 0}"><div class="sh-loading"><span class="vspin"></span>Loading preview&hellip;</div></main>
+<noscript><p class="sh-note">Preview needs JavaScript. Use Download or Raw above.</p></noscript>
+<script src="/static/hljs/highlight.bundle.js?v={__version__}"></script>
+<script src="/static/pdfview.js?v={__version__}"></script>
+<script src="/static/office.js?v={__version__}"></script>
+<script src="/static/share.js?v={__version__}"></script>
+</body></html>"""
+        return Response(doc, media_type="text/html; charset=utf-8", headers={
+            "Cache-Control": "private, no-cache", "Content-Security-Policy": CSP})
+
     @router.post("/api/share")
     async def share(request: Request, d: S.Share):
         n = node_of(await store.refresh(), d.path, file=True)
         hours = int(d.hours or config.get("share_hours"))
         token = shares.dumps({"p": n.path, "e": int(time.time() + hours * 3600)})
-        scheme = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
-        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-        return await jr(request, dict(url=f"{scheme}://{host}/s/{token}", hours=hours))
+        return await jr(request, dict(url=base_url(request) + share_path(token, n.name), hours=hours))
 
     @app.api_route("/s/{token}", methods=["GET", "HEAD"])
-    async def shared(request: Request, token: str, inline: str = ""):
+    @app.api_route("/s/{token}/{name:path}", methods=["GET", "HEAD"])
+    async def shared(request: Request, token: str, name: str = ""):
+        q = request.query_params
         try:
             d = shares.loads(token)
         except BadSignature:
@@ -909,7 +995,14 @@ def create_app(testing=False):
             n = i.files.get(d["p"])
             if not n or n.is_dir:
                 return Response("This file no longer exists.", status_code=404, media_type="text/plain")
-            return await serve_file(request, n, i, download=inline != "1")
+            if q.get("pdf"):
+                return await office_pdf(request, n, i)
+            if wants_page(request, q):
+                return share_page(request, token, n)
+            download = bool(q.get("download")) or q.get("inline") == "0"
+            # Scripts and source files are served as text/plain so a browser (or curl -i) shows them instead of saving them.
+            ctype = "text/plain; charset=utf-8" if not download and kind_of(n.name) == "text" else None
+            return await serve_file(request, n, i, download=download, ctype=ctype)
         except VfsError as e:
             return Response(str(e), status_code=e.status, media_type="text/plain")
 

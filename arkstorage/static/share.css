@@ -1,0 +1,49 @@
+/* Ark Storage: public share page (/s/<token>). Uses the app's design tokens and viewer styles from style.css. */
+body.share { overflow: hidden; display: flex; flex-direction: column; height: 100%; padding-top: env(safe-area-inset-top); }
+.sh-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--line); flex: none; }
+.sh-head img { border-radius: 8px; flex: none; }
+.sh-title { min-width: 0; flex: 1; }
+.sh-title h1 { margin: 0; font-size: 16px; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sh-title p { margin: 0; font-size: 12px; }
+.sh-actions { display: flex; gap: 8px; flex: none; }
+.muted { color: var(--muted); }
+.sh-cmds { display: flex; flex-direction: column; gap: 6px; padding: 8px 14px; background: var(--panel-2); border-bottom: 1px solid var(--line); flex: none; }
+.cmd { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.cmd .cl { flex: none; width: 58px; font-size: 12px; color: var(--muted); }
+.cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; font: 13px/1.4 var(--mono); padding: 7px 10px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; scrollbar-width: thin; user-select: all; }
+.cmd .btn { height: 32px; padding: 0 12px; flex: none; }
+.sh-view { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; background: var(--bg); }
+.sh-loading, .sh-note { margin: auto; display: flex; align-items: center; gap: 12px; color: var(--muted); padding: 24px; text-align: center; }
+.sh-loading .vspin { border-color: var(--line); border-top-color: var(--accent); }
+.sh-card { margin: auto; text-align: center; padding: 28px; max-width: 420px; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.sh-card .big { width: 64px; height: 64px; border-radius: 16px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-weight: 700; font-size: 15px; }
+.sh-img { flex: 1; min-height: 0; display: grid; place-items: center; overflow: auto; padding: 12px; }
+.sh-img img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; background: repeating-conic-gradient(var(--panel-2) 0 25%, var(--panel) 0 50%) 0 0 / 16px 16px; }
+.sh-media { margin: auto; width: min(100%, 960px); padding: 12px; }
+.sh-media video { width: 100%; max-height: calc(100vh - 220px); background: #000; border-radius: 8px; }
+.sh-media audio { width: 100%; }
+.sh-code { flex: 1; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; background: var(--panel); }
+.code { margin: 0; padding: 14px 16px 40px; font: 13px/1.55 var(--mono); tab-size: 4; white-space: pre; min-width: max-content; counter-reset: ln; }
+.code .ln { display: inline-block; counter-increment: ln; }
+.code .ln::before { content: counter(ln); display: inline-block; width: 3.4ch; margin-right: 1.6ch; text-align: right; color: var(--muted); opacity: .6; user-select: none; }
+.sh-trunc { padding: 10px 16px; font-size: 12px; background: var(--panel-2); color: var(--muted); border-top: 1px solid var(--line); flex: none; }
+.sh-view .pvhost { border-radius: 0; }
+@media (max-width: 640px) {
+  .sh-head { flex-wrap: wrap; } .sh-actions { width: 100%; } .sh-actions .btn { flex: 1; }
+  .cmd .cl { display: none; }
+}
+/* syntax colours (same token palette as the editor) */
+.code .hljs-keyword, .code .hljs-selector-tag, .code .hljs-doctag, .code .hljs-template-tag, .code .hljs-meta .hljs-keyword { color: var(--tk-kw); }
+.code .hljs-string, .code .hljs-regexp, .code .hljs-char, .code .hljs-template-variable + .hljs-string, .code .hljs-meta .hljs-string, .code .hljs-link, .code .hljs-code { color: var(--tk-str); }
+.code .hljs-number, .code .hljs-literal, .code .hljs-symbol, .code .hljs-bullet, .code .hljs-built_in, .code .hljs-selector-id, .code .hljs-formula { color: var(--tk-num); }
+.code .hljs-comment, .code .hljs-quote { color: var(--tk-com); font-style: italic; }
+.code .hljs-title, .code .hljs-title.function_, .code .hljs-section { color: var(--tk-fn); }
+.code .hljs-title.class_, .code .hljs-type, .code .hljs-class .hljs-title, .code .hljs-selector-class, .code .hljs-title.class_.inherited__ { color: var(--tk-ty); }
+.code .hljs-attr, .code .hljs-attribute, .code .hljs-property { color: var(--tk-attr); }
+.code .hljs-tag, .code .hljs-name { color: var(--tk-tag); }
+.code .hljs-variable, .code .hljs-template-variable, .code .hljs-params, .code .hljs-subst { color: var(--tk-var); }
+.code .hljs-meta { color: var(--tk-com); }
+.code .hljs-addition { color: var(--tk-add); background: rgba(46, 160, 67, .15); } .code .hljs-deletion { color: var(--tk-del); background: rgba(248, 81, 73, .15); }
+.code .hljs-emphasis { font-style: italic; } .code .hljs-strong { font-weight: 700; }
+.code .hljs-tag .hljs-attr { color: var(--tk-attr); } .code .hljs-tag .hljs-string { color: var(--tk-str); }

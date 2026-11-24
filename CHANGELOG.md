@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.2 - share links preview the file and work with `curl | sh`
+
+* **Share links now open a preview page** in a browser instead of forcing a download: images, video, audio, PDFs, Word/Excel/PowerPoint and text/code (syntax coloured, line numbers) are shown, with **Download**, **Raw** and **Copy link** buttons. Files that can't be previewed get a clean Download card.
+* **The same link serves the raw file to command-line tools.** `curl`, `wget`, `fetch`, PowerShell, scripts and anything else that does not ask for HTML gets the bytes, so a shared `install.sh` works as `curl -fsSL https://<domain>/s/<token>/install.sh | sh`. Text and script files are sent as `text/plain` and inline, ranges and `HEAD` work.
+* **Ready-to-paste commands on the preview page**: "Run" for scripts (`sh`, `bash`, `zsh`, `python3 -`, `node`, `ruby`, `perl`, `php`, PowerShell `irm | iex`) and "Save" (`curl -fLO`) for everything.
+* New links end in the file name (`/s/<token>/install.sh`) so the address bar and `curl -O` look right; the token alone still identifies the file, so **old links keep working**.
+* Query switches: `?raw=1` (bytes), `?download=1` (attachment), `?preview=1` (page, even for curl).
+* Old Office formats (`.doc`, `.ppt`, `.odt`) are previewed on share pages too when LibreOffice is installed.
+
 ## 2.0.1 - code editor, clean URLs, Back button, frozen buttons
 
 **Code editor**

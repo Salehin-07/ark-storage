@@ -83,6 +83,57 @@ class ApiTests(ApiCase):
             a.job(a.call("post", "/api/extract", json={"path": "/docs.zip"}))
             self.assertEqual(a.call("get", "/api/raw?path=/docs/docs/hi.txt").data, b"changed")
 
+    def test_share_link_preview_page_and_curl(self):
+        """One link: browsers get a preview page, curl/wget get the bytes (so `curl <link> | sh` works)."""
+        with sandbox() as (st, remote):
+            a = Api(st, remote)
+            a.login()
+            script = b"#!/bin/sh\necho hello from ark\n"
+            a.upload([("install.sh", script), ("pic.png", b"\x89PNG\r\n\x1a\n" + b"0" * 50)])
+            link = a.call("post", "/api/share", json={"path": "/install.sh", "hours": 1}).get_json()["url"]
+            self.assertTrue(link.endswith("/install.sh"), link)
+            path = link.replace("http://localhost", "")
+            token_only = path.rsplit("/", 1)[0]
+            anon = a.anon()
+            # curl-style requests: raw bytes, text/plain, inline, same through the bare token
+            for p in (path, token_only):
+                r = anon.get(p, headers={"User-Agent": "curl/8.5.0", "Accept": "*/*"})
+                self.assertEqual(r.data, script)
+                self.assertTrue(r.headers["content-type"].startswith("text/plain"), r.headers["content-type"])
+                self.assertTrue(r.headers["content-disposition"].startswith("inline"))
+            # Accept */* with no user agent (python, fetch, ...) is raw too
+            self.assertEqual(anon.get(path).data, script)
+            # a browser gets the preview page
+            browser = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "User-Agent": "Mozilla/5.0"}
+            r = anon.get(path, headers=browser)
+            self.assertTrue(r.headers["content-type"].startswith("text/html"))
+            page = r.data.decode()
+            self.assertIn("install.sh", page)
+            self.assertIn("| sh", page)                                  # ready-to-paste run command
+            self.assertIn("curl -fLO", page)
+            self.assertIn('data-kind="text"', page)
+            self.assertIn("/static/share.js", page)
+            # ... unless it asks for the raw bytes or a download explicitly
+            self.assertEqual(anon.get(path + "?raw=1", headers=browser).data, script)
+            d = anon.get(path + "?download=1", headers=browser)
+            self.assertEqual(d.data, script)
+            self.assertTrue(d.headers["content-disposition"].startswith("attachment"))
+            # a tool that happens to send text/html still gets the bytes
+            self.assertEqual(anon.get(path, headers={"User-Agent": "curl/8.5.0", "Accept": "text/html"}).data, script)
+            # HEAD and ranges work on the raw response
+            self.assertEqual(anon.tc.head(path, headers={"User-Agent": "curl/8"}).headers["content-length"], str(len(script)))
+            r = anon.get(path, headers={"User-Agent": "curl/8", "Range": "bytes=0-1"})
+            self.assertEqual((r.status_code, r.data), (206, b"#!"))
+            # images are previewed, and the raw URL serves them with their own type
+            img = a.call("post", "/api/share", json={"path": "/pic.png", "hours": 1}).get_json()["url"].replace("http://localhost", "")
+            page = anon.get(img, headers=browser).data.decode()
+            self.assertIn('data-kind="image"', page)
+            self.assertEqual(anon.get(img + "?raw=1").headers["content-type"], "image/png")
+            # the page escapes the file name
+            self.assertNotIn("<script>alert", page)
+            # tampered or expired links stay errors
+            self.assertEqual(anon.get(token_only + "x", headers=browser).status_code, 404)
+
     def test_upload_conflict_policies_and_path_safety(self):
         with sandbox() as (st, remote):
             a = Api(st, remote)

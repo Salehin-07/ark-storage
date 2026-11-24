@@ -16,7 +16,7 @@ browser, while the actual data lives in a repo you control, private or public, p
   Ranged reads work across pieces, so a 4 GB video still seeks.
 - **Encryption on demand**: AES-256-GCM, applied on the server before anything reaches GitHub. Switch it on for new files, or
   encrypt / decrypt everything later from Settings.
-- **Download as zip** (folders or selections, streamed), **compress** and **extract** zips, **expiring share links**.
+- **Download as zip** (folders or selections, streamed), **compress** and **extract** zips, **expiring share links** that open a preview page in a browser and serve the raw file to `curl`/`wget` (`curl -fsSL <link> | sh` works).
 - **Advanced Settings**: repository, branch, encryption, piece size, cache size, upload limit, trash, theme, account,
   maintenance (clear cache, compact history), all changeable in the UI.
 - **Login** (default `ark` / `ark`, change it in Settings).
