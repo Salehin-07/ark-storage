@@ -21,6 +21,13 @@ jobs:
       - name: Publish
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
-          notes=$(awk -v v="${GITHUB_REF_NAME#v}" '$0 ~ "^## "v"$"{f=1;next} /^## /{f=0} f' CHANGELOG.md)
-          gh release create "$GITHUB_REF_NAME" --title "Ark Storage ${GITHUB_REF_NAME#v}" --notes "$notes" \
-            ark-storage-*.tar.gz ark-storage-*.zip docker-compose.yml render.yaml env.example SHA256SUMS
+          notes=$(awk -v v="${GITHUB_REF_NAME#v}" 'index($0, "## " v " ") == 1 || $0 == "## " v {f=1; next} /^## /{f=0} f' CHANGELOG.md)
+          [ -n "$notes" ] || { echo "No CHANGELOG.md section for ${GITHUB_REF_NAME#v}" >&2; exit 1; }
+          files="ark-storage-*.tar.gz ark-storage-*.zip docker-compose.yml render.yaml env.example SHA256SUMS"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # a re-pushed tag: refresh the existing release instead of failing
+            gh release edit "$GITHUB_REF_NAME" --title "Ark Storage ${GITHUB_REF_NAME#v}" --notes "$notes"
+            gh release upload "$GITHUB_REF_NAME" $files --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --title "Ark Storage ${GITHUB_REF_NAME#v}" --notes "$notes" $files
+          fi

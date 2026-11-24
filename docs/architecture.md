@@ -30,3 +30,16 @@ it can never stall other requests.
 * Uploads stream socket -> temp file in 1 MiB steps, then are hashed into git by a worker thread; back-pressure comes from the socket.
 * Writes are still one commit at a time (the write lock) - that is git's model, not a limit of the server.
 * Keep `ARK_WORKERS=1` unless you route sticky: listing, upload and job tables live in memory.
+
+
+## Share links (v2.0.2)
+
+A link is `/s/<token>[/<file name>]`, where the token is a signed `{path, expiry}` (itsdangerous, salt `ark-share`); the name after it is
+decoration and is ignored. One URL, two answers, chosen per request in `app.shared`:
+
+* **Page** when the client asks for `text/html` and is not a known command-line agent (curl, wget, PowerShell, python-requests, ...):
+  a small server-rendered HTML shell (`share_page`) plus `static/share.js`, which previews the file with the same viewers as the app
+  (PDF.js, the Office renderers, highlight.js) and shows copy-ready `curl` commands.
+* **Bytes** otherwise, through the normal `serve_file` (ranges, ETag, HEAD): inline, `text/plain` for text/script files, so
+  `curl -fsSL <link> | sh` works.
+* Switches: `?raw=1`, `?download=1`, `?preview=1`; `?pdf=1` returns the LibreOffice conversion of an old Office file for the page's viewer.
